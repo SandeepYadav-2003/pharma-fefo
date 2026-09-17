@@ -40,18 +40,15 @@ Plan and implement full-stack Pharma FEFO (First-Expiry-First-Out) Inventory & D
 1. Tech Stack Selection: Python 3 + FastAPI + SQLite + HTML5/TailwindCSS Single Page Application (SPA).
 2. Database Design: Create SQLite schema with `users`, `medicines`, `batches`, and `dispense_logs`.
 3. FEFO Dispensing Algorithm:
-   - Query non-expired active batches (`expiry_date >= TODAY` and `current_qty > 0`) ordered strictly by `expiry_date ASC`.
+   - Query non-expired active batches (`expiry_date >= TODAY` and `current_qty > 0`) ordered strictly by `expiry_date ASC, id ASC`.
    - Block expired batches automatically.
    - Deduct required quantity sequentially across eligible batches.
-4. Rest API Endpoints:
-   - `/api/auth/register`, `/api/auth/login`
-   - `/api/dashboard/stats`
-   - `/api/medicines` (search, pagination, sorting)
-   - `/api/medicines/search` ("Do we have paracetamol in date?")
-   - `/api/batches` (status filtering: all, active, expiring_soon, expired)
-   - `/api/dispense` (FEFO execution engine)
-   - `/api/alerts/expiring` (30-day heads up alerts)
+4. Security & Hygiene Enhancements:
+   - Salted PBKDF2-HMAC-SHA256 password hashing.
+   - UTC PyJWT token expiration & strict `require_auth` Bearer dependency on write routes.
+   - Clamped pagination limits (`1 <= limit <= 100`).
+   - `.gitignore` & `requirements.txt` repo hygiene.
 5. Mandatory Deliverables:
-   - `README.md` (Setup, API endpoint directory, landing page product specs)
+   - `README.md` (Setup, API endpoint directory, 15-second demo script, landing page product specs)
    - `REASONING.md` (Architecture, FEFO algorithm rationale, bug fixes & edge cases)
    - `AI_LOGS.md` (Complete conversation transcript)

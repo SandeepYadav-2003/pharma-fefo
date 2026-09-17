@@ -1,36 +1,29 @@
-# REASONING.md — Technical Architecture, Decision Rationale & Testing Audit
+# REASONING.md — Technical Architecture, Security Rationale & Audit Notes
 
 ## 1. Problem Understanding & Core Strategy
 
 The challenge requires building an end-to-end full-stack product for a neighbourhood pharmacy to solve batch management, inventory visibility, and First-Expiry-First-Out (FEFO) dispensing.
 
 ### Key Domain Rules Handled:
-1. **FEFO Priority**: Stock must be consumed strictly starting from the batch that expires soonest.
+1. **FEFO Priority**: Stock must be consumed strictly starting from the batch that expires soonest (`expiry_date ASC, id ASC`).
 2. **Expired Stock Isolation**: Expired batches (`expiry_date < TODAY`) must **NEVER** be dispensed under any circumstance and must be excluded from sellable stock totals.
 3. **In-Date Stock Queries**: Rapid response to questions like *"Do we have Paracetamol in date?"*.
 4. **Expiry Heads-Up**: Clear visibility into batches nearing expiration (within 30 days).
 
 ---
 
-## 2. Architectural Choices & Stack Selection
+## 2. Architectural & Security Choices
 
-### Stack Chosen: Python 3 (FastAPI) + SQLite + HTML5/TailwindCSS Single-Page App
-- **Why FastAPI?**: 
-  - Zero-overhead async Python framework with automatic OpenAPI documentation.
-  - Native Pydantic data validation ensures bad inputs are caught before reaching the DB.
-  - Extremely lightweight — runs out-of-the-box in GitHub Codespaces without complex build tools.
-- **Why SQLite?**: 
-  - Zero setup, self-contained relational database built into Python's standard library.
-  - Supports SQL foreign keys, ACID transactions, aggregate functions (`SUM`, `CASE WHEN`, `MIN`), and fast date comparisons (`YYYY-MM-DD`).
-- **Why Single-Page Application (SPA) UI?**:
-  - Blazing fast UX with instant tab switching (Landing Page, Dashboard, Inventory, Batches, Dispenser, Alerts).
-  - Uses Tailwind CSS via CDN for a modern, responsive presentation.
+### Security & Access Control Design:
+- **Public Read Access (By Design)**: Read endpoints (`/api/medicines`, `/api/batches`, `/api/medicines/search`, `/api/alerts/expiring`) are public to allow instant walk-in inventory lookup and public landing page visibility without requiring login friction.
+- **Strict Bearer Token Auth (Write Operations)**: Write operations (`POST /api/dispense`, `POST /api/medicines`, `POST /api/batches`) strictly enforce `require_auth` with JWT tokens, returning HTTP 401 on missing or invalid headers.
+- **Salted Password Hashing**: Uses standard library `hashlib.pbkdf2_hmac` (`sha256`, 100,000 iterations) with 16-byte random hex salts (`os.urandom(16).hex()`).
 
 ---
 
-## 3. FEFO Algorithm Design & Implementation Detail
+## 3. FEFO Algorithm Design & Boundary Policies
 
-The FEFO algorithm in `POST /api/dispense` operates as follows:
+The FEFO algorithm in `POST /api/dispense` executes:
 
 ```sql
 SELECT id, batch_number, expiry_date, current_qty, unit_price
@@ -39,37 +32,13 @@ WHERE medicine_id = ? AND expiry_date >= CURRENT_DATE AND current_qty > 0
 ORDER BY expiry_date ASC, id ASC
 ```
 
-### Execution Flow:
-1. **Filtering**: Strictly filters `expiry_date >= TODAY` and `current_qty > 0`. This guarantees expired batches are completely invisible to the algorithm.
-2. **Sorting**: Orders by `expiry_date ASC`. The earliest expiring batch is always at index `0`.
-3. **Deduction Loop**:
-   - Calculates `take_qty = min(batch.current_qty, remaining_needed)`.
-   - Decrements `batch.current_qty` in the database.
-   - Logs an audit row in `dispense_logs` capturing `batch_id`, `quantity_dispensed`, `dispensed_by`, and timestamp.
-4. **Transaction Integrity**: Wrapped inside a single SQLite database transaction to prevent partial updates.
+### Expiry Date Boundary Policy:
+- A batch expiring on **today's date** (`expiry_date == TODAY`) is treated as sellable through the end of the current day.
+- A batch expiring **yesterday or earlier** (`expiry_date < TODAY`) is strictly marked `EXPIRED` and ignored.
 
 ---
 
-## 4. Testing Strategy & Edge Cases Verified
+## 4. Known Limitations & Future Enhancements
 
-During development, the system was tested against the following critical edge cases:
-
-### Case 1: Dispense Quantity Exceeds Single Batch
-- **Scenario**: Customer orders 180 units of Paracetamol. Batch A has 150 units (expires in 15 days), Batch B has 300 units (expires in 180 days).
-- **Result**: System automatically took 150 units from Batch A (depleting it to 0) and 30 units from Batch B, recording a multi-batch FEFO breakdown.
-
-### Case 2: Attempting to Dispense Expired Stock
-- **Scenario**: Paracetamol Batch C has 50 units but expired 10 days ago.
-- **Result**: FEFO query ignores Batch C entirely. If only Batch C is available, the API returns HTTP 400 *"Insufficient sellable stock (0 sellable units)"*.
-
-### Case 3: In-Date Stock Calculation
-- **Query**: `GET /api/medicines/search?q=paracetamol`
-- **Result**: Returns sellable stock as 450 units (150 from Batch A + 300 from Batch B), ignoring the 50 expired units in Batch C.
-
----
-
-## 5. Bug Fixes & Refinements
-
-1. **Date Format Standardization**: Standardized all date strings to ISO 8601 `YYYY-MM-DD` for lexicographical sorting in SQLite queries.
-2. **Dynamic Badging**: Added automated badge coloring (`green` for >30d, `amber` for <=30d, `rose` for expired) in both backend APIs and UI components.
-3. **CORS & Middleware**: Configured `CORSMiddleware` to allow seamless API access from external environments (like Codespaces port forwarding).
+1. **Database Concurrency**: Under extreme concurrent write volume, two simultaneous dispense requests could inspect the same `current_qty` row. In a multi-worker production environment, this would be addressed with explicit row-level locking (`SELECT ... FOR UPDATE` in PostgreSQL or atomic `UPDATE batches SET current_qty = current_qty - ? WHERE id = ? AND current_qty >= ?` in SQLite).
+2. **Single-File Architecture Choice**: The system was intentionally implemented as a single, self-contained `app.py` to eliminate module import overhead during a 2.5-hour build round, mapping cleanly into standard `routers/`, `models/`, and `services/` layers for production.

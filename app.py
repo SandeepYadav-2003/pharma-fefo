@@ -8,7 +8,7 @@ from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 try:
     import jwt
@@ -17,7 +17,7 @@ except ImportError:
     HAS_JWT = False
 
 DB_FILE = "pharma_fefo.db"
-SECRET_KEY = "aurigait_pharma_fefo_secret_key_2026"
+SECRET_KEY = os.getenv("SECRET_KEY", "aurigait_pharma_fefo_secret_key_2026")
 
 app = FastAPI(
     title="Pharma FEFO Inventory & Dispensing Engine",
@@ -28,13 +28,74 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # -----------------------------------------------------------------------------
-# DATABASE INITIALIZATION & HELPER FUNCTIONS
+# AUTHENTICATION & SECURITY HELPERS
+# -----------------------------------------------------------------------------
+
+def hash_password(password: str, salt: Optional[str] = None) -> str:
+    """PBKDF2-HMAC-SHA256 salted password hashing (100,000 iterations)."""
+    salt_hex = salt or os.urandom(16).hex()
+    dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), bytes.fromhex(salt_hex), 100_000)
+    return f"{salt_hex}${dk.hex()}"
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        salt, _ = stored_hash.split('$')
+        return hashlib.compare_digest(hash_password(password, salt), stored_hash)
+    except Exception:
+        return False
+
+def create_token(user_id: int, username: str, role: str) -> str:
+    exp_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)
+    payload = {
+        "user_id": user_id,
+        "username": username,
+        "role": role,
+        "exp": exp_time
+    }
+    if HAS_JWT:
+        return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+    else:
+        payload_copy = payload.copy()
+        payload_copy["exp"] = exp_time.isoformat()
+        raw = json.dumps(payload_copy).encode('utf-8')
+        return base64.b64encode(raw).decode('utf-8')
+
+def require_auth(authorization: Optional[str] = Header(None)):
+    """Strict Bearer token authentication required for write operations."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required. Please login.")
+    token = authorization.replace("Bearer ", "").strip()
+    try:
+        if HAS_JWT:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            return payload
+        else:
+            raw = base64.b64decode(token.encode('utf-8')).decode('utf-8')
+            return json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired session token")
+
+def optional_auth(authorization: Optional[str] = Header(None)):
+    """Lenient token inspector for public reads."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return {"user_id": 0, "username": "guest", "role": "public"}
+    try:
+        token = authorization.replace("Bearer ", "").strip()
+        if HAS_JWT:
+            return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        else:
+            raw = base64.b64decode(token.encode('utf-8')).decode('utf-8')
+            return json.loads(raw)
+    except Exception:
+        return {"user_id": 0, "username": "guest", "role": "public"}
+
+# -----------------------------------------------------------------------------
+# DATABASE SETUP & SEEDING
 # -----------------------------------------------------------------------------
 
 def get_db():
@@ -42,41 +103,10 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode('utf-8')).hexdigest()
-
-def create_token(user_id: int, username: str, role: str) -> str:
-    payload = {
-        "user_id": user_id,
-        "username": username,
-        "role": role,
-        "exp": (datetime.datetime.utcnow() + datetime.timedelta(days=7)).isoformat()
-    }
-    if HAS_JWT:
-        return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
-    else:
-        raw = json.dumps(payload).encode('utf-8')
-        return base64.b64encode(raw).decode('utf-8')
-
-def verify_token(authorization: Optional[str] = Header(None)):
-    if not authorization:
-        # Default guest/pharmacist user for smooth UI experience
-        return {"user_id": 1, "username": "pharmacist", "role": "admin"}
-    try:
-        token = authorization.replace("Bearer ", "")
-        if HAS_JWT:
-            return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        else:
-            raw = base64.b64decode(token.encode('utf-8')).decode('utf-8')
-            return json.loads(raw)
-    except Exception:
-        return {"user_id": 1, "username": "pharmacist", "role": "admin"}
-
 def init_db():
     conn = get_db()
     cursor = conn.cursor()
     
-    # Create Users Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,7 +118,6 @@ def init_db():
     );
     """)
 
-    # Create Medicines Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS medicines (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,7 +130,6 @@ def init_db():
     );
     """)
 
-    # Create Batches Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS batches (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,7 +145,6 @@ def init_db():
     );
     """)
 
-    # Create Dispense Logs Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS dispense_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,7 +161,7 @@ def init_db():
 
     conn.commit()
 
-    # Seed initial user if table empty
+    # Seed default admin user
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
         admin_pass = hash_password("admin123")
@@ -142,7 +169,7 @@ def init_db():
                        ("pharmacist", "pharmacist@aurigait-pharma.com", admin_pass, "admin"))
         conn.commit()
 
-    # Seed sample medicines & batches if empty
+    # Dynamic date-relative seeding
     cursor.execute("SELECT COUNT(*) FROM medicines")
     if cursor.fetchone()[0] == 0:
         today = datetime.date.today()
@@ -160,23 +187,22 @@ def init_db():
                            (name, gen, cat, unit, thresh))
         conn.commit()
 
-        # Add batches (Active, Expiring Soon, Expired)
         batches_data = [
             # Paracetamol
-            (1, "PARA-B2026-01", (today + datetime.timedelta(days=15)).strftime("%Y-%m-%d"), 150, 150, 2.50, "Sun Pharma"),  # Expiring soon
-            (1, "PARA-B2026-02", (today + datetime.timedelta(days=180)).strftime("%Y-%m-%d"), 300, 300, 2.40, "Cipla"),        # Long active
-            (1, "PARA-B2025-09", (today - datetime.timedelta(days=10)).strftime("%Y-%m-%d"), 50, 50, 2.00, "Sun Pharma"),    # EXPIRED!
+            (1, "PARA-B2026-01", (today + datetime.timedelta(days=15)).strftime("%Y-%m-%d"), 150, 150, 2.50, "Sun Pharma"),  # Expiring soon (15d)
+            (1, "PARA-B2026-02", (today + datetime.timedelta(days=180)).strftime("%Y-%m-%d"), 300, 300, 2.40, "Cipla"),        # Long active (180d)
+            (1, "PARA-B2025-09", (today - datetime.timedelta(days=10)).strftime("%Y-%m-%d"), 50, 50, 2.00, "Sun Pharma"),    # EXPIRED (-10d)
             
             # Amoxicillin
-            (2, "AMOX-B2026-01", (today + datetime.timedelta(days=5)).strftime("%Y-%m-%d"), 80, 80, 8.50, "GlaxoSmithKline"), # Expiring very soon!
-            (2, "AMOX-B2026-05", (today + datetime.timedelta(days=90)).strftime("%Y-%m-%d"), 200, 200, 8.00, "Abbott"),      # Active
+            (2, "AMOX-B2026-01", (today + datetime.timedelta(days=5)).strftime("%Y-%m-%d"), 80, 80, 8.50, "GlaxoSmithKline"), # Expiring soon (5d)
+            (2, "AMOX-B2026-05", (today + datetime.timedelta(days=90)).strftime("%Y-%m-%d"), 200, 200, 8.00, "Abbott"),      # Active (90d)
             
             # Ibuprofen
-            (3, "IBU-B2026-11", (today + datetime.timedelta(days=25)).strftime("%Y-%m-%d"), 120, 120, 4.00, "Pfizer"),       # Expiring soon
-            (3, "IBU-B2025-12", (today - datetime.timedelta(days=40)).strftime("%Y-%m-%d"), 40, 40, 3.50, "Pfizer"),        # EXPIRED!
+            (3, "IBU-B2026-11", (today + datetime.timedelta(days=25)).strftime("%Y-%m-%d"), 120, 120, 4.00, "Pfizer"),       # Expiring soon (25d)
+            (3, "IBU-B2025-12", (today - datetime.timedelta(days=40)).strftime("%Y-%m-%d"), 40, 40, 3.50, "Pfizer"),        # EXPIRED (-40d)
             
             # Cetirizine
-            (4, "CET-B2026-03", (today + datetime.timedelta(days=200)).strftime("%Y-%m-%d"), 500, 500, 1.50, "Dr. Reddy's")  # Active
+            (4, "CET-B2026-03", (today + datetime.timedelta(days=200)).strftime("%Y-%m-%d"), 500, 500, 1.50, "Dr. Reddy's")  # Active (200d)
         ]
 
         for med_id, bno, exp, init_q, cur_q, price, supp in batches_data:
@@ -186,17 +212,29 @@ def init_db():
 
     conn.close()
 
-# Initialize DB on startup
+# Initialize DB
 init_db()
 
 # -----------------------------------------------------------------------------
-# PYDANTIC SCHEMAS
+# PYDANTIC SCHEMAS WITH INPUT VALIDATION
 # -----------------------------------------------------------------------------
 
 class UserRegister(BaseModel):
     username: str
     email: str
     password: str
+
+    @field_validator('password')
+    def validate_password_length(cls, v):
+        if len(v.strip()) < 6:
+            raise ValueError('Password must be at least 6 characters long')
+        return v
+
+    @field_validator('email')
+    def validate_email_format(cls, v):
+        if '@' not in v or '.' not in v.split('@')[-1]:
+            raise ValueError('Invalid email format')
+        return v
 
 class UserLogin(BaseModel):
     username: str
@@ -247,13 +285,13 @@ def register(user: UserRegister):
 def login(credentials: UserLogin):
     conn = get_db()
     cursor = conn.cursor()
-    hashed = hash_password(credentials.password)
-    cursor.execute("SELECT id, username, role FROM users WHERE username = ? AND password_hash = ?",
-                   (credentials.username, hashed))
+    cursor.execute("SELECT id, username, password_hash, role FROM users WHERE username = ?", (credentials.username,))
     user = cursor.fetchone()
     conn.close()
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    if not user or not verify_password(credentials.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
     token = create_token(user["id"], user["username"], user["role"])
     return {"status": "success", "token": token, "username": user["username"], "role": user["role"]}
 
@@ -264,23 +302,18 @@ def get_dashboard_stats():
     today_str = datetime.date.today().strftime("%Y-%m-%d")
     soon_str = (datetime.date.today() + datetime.timedelta(days=30)).strftime("%Y-%m-%d")
 
-    # Total Medicines
     cursor.execute("SELECT COUNT(*) FROM medicines")
     total_medicines = cursor.fetchone()[0]
 
-    # Total Sellable Stock Count (excluding expired batches)
     cursor.execute("SELECT COALESCE(SUM(current_qty), 0) FROM batches WHERE expiry_date >= ? AND current_qty > 0", (today_str,))
     total_sellable_stock = cursor.fetchone()[0]
 
-    # Batches Expiring Soon (Within 30 Days)
     cursor.execute("SELECT COUNT(*) FROM batches WHERE expiry_date >= ? AND expiry_date <= ? AND current_qty > 0", (today_str, soon_str))
     expiring_soon_count = cursor.fetchone()[0]
 
-    # Already Expired Batches
     cursor.execute("SELECT COUNT(*) FROM batches WHERE expiry_date < ? AND current_qty > 0", (today_str,))
     expired_count = cursor.fetchone()[0]
 
-    # Total Dispensed Today
     cursor.execute("SELECT COALESCE(SUM(quantity_dispensed), 0) FROM dispense_logs WHERE DATE(dispensed_at) = ?", (today_str,))
     dispensed_today = cursor.fetchone()[0]
 
@@ -298,8 +331,8 @@ def get_dashboard_stats():
 @app.get("/api/medicines")
 def get_medicines(
     search: Optional[str] = None,
-    page: int = 1,
-    limit: int = 10,
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
     sort_by: str = "name",
     order: str = "asc"
 ):
@@ -329,7 +362,6 @@ def get_medicines(
 
     query += f" GROUP BY m.id ORDER BY {sort_col} {sort_order}"
 
-    # Calculate pagination count
     count_query = "SELECT COUNT(*) FROM (" + query + ")"
     cursor.execute(count_query, params)
     total_records = cursor.fetchone()[0]
@@ -355,7 +387,7 @@ def get_medicines(
     }
 
 @app.post("/api/medicines")
-def create_medicine(med: MedicineCreate):
+def create_medicine(med: MedicineCreate, user: dict = Depends(require_auth)):
     conn = get_db()
     cursor = conn.cursor()
     try:
@@ -371,7 +403,7 @@ def create_medicine(med: MedicineCreate):
 
 @app.get("/api/medicines/search")
 def search_in_date_medicine(q: str):
-    """'Do we have paracetamol in date?' query endpoint"""
+    """'Do we have paracetamol in date?' query endpoint (Searches name, generic name & category)."""
     conn = get_db()
     cursor = conn.cursor()
     today_str = datetime.date.today().strftime("%Y-%m-%d")
@@ -382,9 +414,9 @@ def search_in_date_medicine(q: str):
            MIN(CASE WHEN b.expiry_date >= ? AND b.current_qty > 0 THEN b.expiry_date END) AS earliest_expiry
     FROM medicines m
     LEFT JOIN batches b ON m.id = b.medicine_id
-    WHERE m.name LIKE ? OR m.generic_name LIKE ?
+    WHERE m.name LIKE ? OR m.generic_name LIKE ? OR m.category LIKE ?
     GROUP BY m.id
-    """, (today_str, today_str, f"%{q}%", f"%{q}%"))
+    """, (today_str, today_str, f"%{q}%", f"%{q}%", f"%{q}%"))
 
     results = [dict(row) for row in cursor.fetchall()]
     conn.close()
@@ -396,6 +428,7 @@ def search_in_date_medicine(q: str):
             "id": r["id"],
             "name": r["name"],
             "generic_name": r["generic_name"],
+            "category": r["category"],
             "in_date_stock": r["in_date_stock"],
             "unit": r["unit"],
             "is_available_in_date": has_in_date_stock,
@@ -409,9 +442,9 @@ def search_in_date_medicine(q: str):
 @app.get("/api/batches")
 def get_batches(
     medicine_id: Optional[int] = None,
-    status: Optional[str] = "all",  # all, active, expiring_soon, expired
-    page: int = 1,
-    limit: int = 10,
+    status: Optional[str] = "all",
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
     sort_by: str = "expiry_date",
     order: str = "asc"
 ):
@@ -451,7 +484,6 @@ def get_batches(
 
     query += f" ORDER BY b.{sort_col} {sort_order}"
 
-    # Calculate pagination count
     count_query = "SELECT COUNT(*) FROM (" + query + ")"
     cursor.execute(count_query, params)
     total_records = cursor.fetchone()[0]
@@ -498,7 +530,7 @@ def get_batches(
     }
 
 @app.post("/api/batches")
-def create_batch(batch: BatchCreate):
+def create_batch(batch: BatchCreate, user: dict = Depends(require_auth)):
     conn = get_db()
     cursor = conn.cursor()
     try:
@@ -519,14 +551,14 @@ def create_batch(batch: BatchCreate):
 # -----------------------------------------------------------------------------
 
 @app.post("/api/dispense")
-def dispense_medicine(req: DispenseRequest, current_user: dict = Depends(verify_token)):
+def dispense_medicine(req: DispenseRequest, current_user: dict = Depends(require_auth)):
     """
     FEFO (First-Expiry-First-Out) Dispensing Algorithm:
-    1. Selects all batches for medicine_id where expiry_date >= TODAY and current_qty > 0
-    2. Orders batches strictly by expiry_date ASC (soonest expiring batch first!)
-    3. Never touches or dispenses expired batches.
-    4. Deducts required quantity sequentially across eligible batches.
-    5. Logs detailed audit record for each consumed batch.
+    1. Selects all active batches for medicine_id where expiry_date >= TODAY and current_qty > 0
+    2. Orders batches strictly by expiry_date ASC, id ASC
+    3. Strictly blocks expired batches from being dispensed
+    4. Deducts required quantity sequentially across eligible batches
+    5. Logs detailed audit record for each consumed batch
     """
     if req.quantity <= 0:
         raise HTTPException(status_code=400, detail="Dispense quantity must be greater than 0")
@@ -535,14 +567,12 @@ def dispense_medicine(req: DispenseRequest, current_user: dict = Depends(verify_
     cursor = conn.cursor()
     today_str = datetime.date.today().strftime("%Y-%m-%d")
 
-    # Get medicine details
     cursor.execute("SELECT id, name, unit FROM medicines WHERE id = ?", (req.medicine_id,))
     med = cursor.fetchone()
     if not med:
         conn.close()
         raise HTTPException(status_code=404, detail="Medicine not found")
 
-    # Fetch active, non-expired batches ordered strictly by FEFO (expiry_date ASC)
     cursor.execute("""
     SELECT id, batch_number, expiry_date, current_qty, unit_price
     FROM batches
@@ -551,7 +581,6 @@ def dispense_medicine(req: DispenseRequest, current_user: dict = Depends(verify_
     """, (req.medicine_id, today_str))
 
     eligible_batches = cursor.fetchall()
-
     total_available = sum(b["current_qty"] for b in eligible_batches)
 
     if total_available < req.quantity:
@@ -575,10 +604,8 @@ def dispense_medicine(req: DispenseRequest, current_user: dict = Depends(verify_
         batch_total = take_qty * batch["unit_price"]
         total_cost += batch_total
 
-        # Update batch quantity in DB
         cursor.execute("UPDATE batches SET current_qty = ? WHERE id = ?", (new_batch_qty, batch["id"]))
 
-        # Log dispensing event
         cursor.execute("""
         INSERT INTO dispense_logs (medicine_id, batch_id, quantity_dispensed, dispensed_by, customer_name)
         VALUES (?, ?, ?, ?, ?)
@@ -615,7 +642,6 @@ def get_expiring_alerts():
     today_str = today.strftime("%Y-%m-%d")
     soon_str = (today + datetime.timedelta(days=30)).strftime("%Y-%m-%d")
 
-    # Expiring soon (within 30 days)
     cursor.execute("""
     SELECT b.id, b.batch_number, b.expiry_date, b.current_qty, b.unit_price, m.name as medicine_name, m.unit
     FROM batches b
@@ -629,7 +655,6 @@ def get_expiring_alerts():
         d["days_left"] = (datetime.datetime.strptime(d["expiry_date"], "%Y-%m-%d").date() - today).days
         expiring_soon.append(d)
 
-    # Already expired
     cursor.execute("""
     SELECT b.id, b.batch_number, b.expiry_date, b.current_qty, b.unit_price, m.name as medicine_name, m.unit
     FROM batches b
@@ -700,7 +725,7 @@ def index_page():
 
             <div class="flex items-center space-x-4">
                 <span id="user-display" class="text-xs bg-slate-800 border border-slate-700 px-3 py-1.5 rounded-full text-slate-300">
-                    <i class="fa-solid fa-user-shield text-emerald-400 mr-1"></i> Pharmacist (Admin)
+                    <i class="fa-solid fa-user-shield text-emerald-400 mr-1"></i> <span id="current-username">Pharmacist (Admin)</span>
                 </span>
                 <button onclick="openAuthModal()" class="bg-sky-600 hover:bg-sky-500 text-white text-xs px-3 py-1.5 rounded-md font-semibold transition">
                     Login / Reg
@@ -916,13 +941,20 @@ def index_page():
                 </div>
             </div>
 
-            <!-- Filter Status Bar -->
+            <!-- Filter & Sort Status Bar -->
             <div class="bg-white p-4 rounded-xl border border-slate-200 flex flex-wrap gap-4 items-center justify-between">
                 <div class="flex space-x-2 text-xs font-semibold">
                     <button onclick="setBatchFilter('all')" class="batch-filter-btn px-3 py-1.5 rounded-lg bg-slate-900 text-white" data-status="all">All Batches</button>
                     <button onclick="setBatchFilter('active')" class="batch-filter-btn px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600" data-status="active">Active (In-Date)</button>
                     <button onclick="setBatchFilter('expiring_soon')" class="batch-filter-btn px-3 py-1.5 rounded-lg bg-amber-100 text-amber-700" data-status="expiring_soon">Expiring Soon (&lt;30d)</button>
                     <button onclick="setBatchFilter('expired')" class="batch-filter-btn px-3 py-1.5 rounded-lg bg-rose-100 text-rose-700" data-status="expired">Expired</button>
+                </div>
+                <div class="flex items-center space-x-3 text-xs">
+                    <label class="font-semibold text-slate-500">Sort By Expiry:</label>
+                    <select id="batch-sort-order" onchange="loadBatches()" class="bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 outline-none font-semibold">
+                        <option value="asc">Earliest Expiring First</option>
+                        <option value="desc">Latest Expiring First</option>
+                    </select>
                 </div>
             </div>
 
@@ -997,7 +1029,6 @@ def index_page():
             <h2 class="text-2xl font-extrabold text-slate-900">Batch Expiry Radar & Alerts</h2>
 
             <div class="grid md:grid-cols-2 gap-6">
-                <!-- Expiring Soon Box -->
                 <div class="bg-amber-50 border border-amber-200 rounded-2xl p-6 space-y-4">
                     <h3 class="font-bold text-amber-900 text-lg flex items-center space-x-2">
                         <i class="fa-solid fa-triangle-exclamation text-amber-600"></i>
@@ -1006,7 +1037,6 @@ def index_page():
                     <div id="alerts-expiring-list" class="space-y-3"></div>
                 </div>
 
-                <!-- Already Expired Box (Blocked) -->
                 <div class="bg-rose-50 border border-rose-200 rounded-2xl p-6 space-y-4">
                     <h3 class="font-bold text-rose-900 text-lg flex items-center space-x-2">
                         <i class="fa-solid fa-ban text-rose-600"></i>
@@ -1023,16 +1053,27 @@ def index_page():
     <div id="auth-modal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm hidden z-50 flex items-center justify-center p-4">
         <div class="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl space-y-4 relative">
             <button onclick="closeAuthModal()" class="absolute top-4 right-4 text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark text-xl"></i></button>
-            <h3 class="text-xl font-bold text-slate-900 text-center" id="auth-modal-title">Pharmacist Login</h3>
+            <h3 class="text-xl font-bold text-slate-900 text-center" id="auth-modal-title">Pharmacist Authentication</h3>
+            
+            <div class="flex border-b border-slate-200 mb-4">
+                <button onclick="switchAuthTab('login')" id="auth-tab-login" class="flex-1 py-2 font-bold text-sm text-sky-600 border-b-2 border-sky-600">Login</button>
+                <button onclick="switchAuthTab('register')" id="auth-tab-reg" class="flex-1 py-2 font-bold text-sm text-slate-400">Register</button>
+            </div>
+
             <form onsubmit="handleAuthSubmit(event)" class="space-y-4">
                 <div>
                     <label class="block text-xs font-bold text-slate-600 mb-1">Username</label>
                     <input type="text" id="auth-user" required class="w-full p-2.5 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-sky-500">
                 </div>
+                <div id="auth-email-group" class="hidden">
+                    <label class="block text-xs font-bold text-slate-600 mb-1">Email</label>
+                    <input type="email" id="auth-email" class="w-full p-2.5 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-sky-500">
+                </div>
                 <div>
                     <label class="block text-xs font-bold text-slate-600 mb-1">Password</label>
                     <input type="password" id="auth-pass" required class="w-full p-2.5 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-sky-500">
                 </div>
+                <div id="auth-error-msg" class="hidden text-xs text-rose-600 font-semibold"></div>
                 <button type="submit" class="w-full py-3 bg-sky-600 hover:bg-sky-500 text-white font-bold rounded-xl transition">Submit</button>
             </form>
         </div>
@@ -1043,14 +1084,21 @@ def index_page():
         let currentTab = 'landing';
         let invPage = 1;
         let batchStatus = 'all';
-        let allMedicinesCache = [];
+        let authMode = 'login';
+        let authToken = localStorage.getItem('pharma_token') || '';
+        let authUser = localStorage.getItem('pharma_username') || 'Pharmacist (Admin)';
 
         document.addEventListener('DOMContentLoaded', () => {
+            if(authUser) document.getElementById('current-username').innerText = authUser;
             loadDashboardStats();
             loadMedicines();
             loadBatches();
             loadAlerts();
         });
+
+        function getAuthHeader() {
+            return authToken ? { 'Authorization': `Bearer ${authToken}` } : {};
+        }
 
         function showTab(tabName) {
             ['landing', 'dashboard', 'inventory', 'batches', 'dispenser', 'alerts'].forEach(t => {
@@ -1109,7 +1157,6 @@ def index_page():
             const order = document.getElementById('inv-order').value;
             const res = await fetch(`/api/medicines?search=${encodeURIComponent(search)}&page=${invPage}&limit=10&sort_by=${sort}&order=${order}`);
             const json = await res.json();
-            allMedicinesCache = json.data;
             const tbody = document.getElementById('inventory-tbody');
             tbody.innerHTML = json.data.map(m => `
                 <tr class="hover:bg-slate-50 transition">
@@ -1137,7 +1184,8 @@ def index_page():
         }
 
         async function loadBatches() {
-            const res = await fetch(`/api/batches?status=${batchStatus}&page=1&limit=50`);
+            const order = document.getElementById('batch-sort-order').value;
+            const res = await fetch(`/api/batches?status=${batchStatus}&page=1&limit=50&sort_by=expiry_date&order=${order}`);
             const json = await res.json();
             const tbody = document.getElementById('batches-tbody');
             tbody.innerHTML = json.data.map(b => `
@@ -1211,14 +1259,22 @@ def index_page():
             const resBox = document.getElementById('dispense-result');
 
             try {
+                const headers = { 'Content-Type': 'application/json', ...getAuthHeader() };
                 const res = await fetch('/api/dispense', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: headers,
                     body: JSON.stringify({ medicine_id: medId, quantity: qty, customer_name: cust })
                 });
 
                 const data = await res.json();
                 resBox.classList.remove('hidden');
+
+                if(res.status === 401) {
+                    openAuthModal();
+                    document.getElementById('auth-error-msg').innerText = "Authentication required to execute dispensing. Please login as Pharmacist (admin/admin123).";
+                    document.getElementById('auth-error-msg').classList.remove('hidden');
+                    return;
+                }
 
                 if(!res.ok) {
                     resBox.innerHTML = `
@@ -1288,12 +1344,51 @@ def index_page():
                 });
         }
 
+        function switchAuthTab(mode) {
+            authMode = mode;
+            document.getElementById('auth-tab-login').className = mode === 'login' ? 'flex-1 py-2 font-bold text-sm text-sky-600 border-b-2 border-sky-600' : 'flex-1 py-2 font-bold text-sm text-slate-400';
+            document.getElementById('auth-tab-reg').className = mode === 'register' ? 'flex-1 py-2 font-bold text-sm text-sky-600 border-b-2 border-sky-600' : 'flex-1 py-2 font-bold text-sm text-slate-400';
+            if(mode === 'register') {
+                document.getElementById('auth-email-group').classList.remove('hidden');
+            } else {
+                document.getElementById('auth-email-group').classList.add('hidden');
+            }
+            document.getElementById('auth-error-msg').classList.add('hidden');
+        }
+
         function openAuthModal() { document.getElementById('auth-modal').classList.remove('hidden'); }
         function closeAuthModal() { document.getElementById('auth-modal').classList.add('hidden'); }
-        function handleAuthSubmit(e) {
+
+        async function handleAuthSubmit(e) {
             e.preventDefault();
-            alert("Authenticated successfully as Pharmacist!");
-            closeAuthModal();
+            const user = document.getElementById('auth-user').value;
+            const pass = document.getElementById('auth-pass').value;
+            const email = document.getElementById('auth-email').value;
+            const errBox = document.getElementById('auth-error-msg');
+
+            const url = authMode === 'login' ? '/api/auth/login' : '/api/auth/register';
+            const body = authMode === 'login' ? { username: user, password: pass } : { username: user, email: email, password: pass };
+
+            try {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json();
+                if(!res.ok) {
+                    errBox.innerText = data.detail || 'Authentication failed';
+                    errBox.classList.remove('hidden');
+                } else {
+                    authToken = data.token;
+                    authUser = data.username;
+                    localStorage.setItem('pharma_token', authToken);
+                    localStorage.setItem('pharma_username', authUser);
+                    document.getElementById('current-username').innerText = authUser;
+                    closeAuthModal();
+                    alert(`Successfully authenticated as ${authUser}!`);
+                }
+            } catch(err) { console.error(err); }
         }
     </script>
 </body>
@@ -1301,7 +1396,6 @@ def index_page():
 """
     return HTMLResponse(content=html_content, status_code=200)
 
-# Entry point for running app directly
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
