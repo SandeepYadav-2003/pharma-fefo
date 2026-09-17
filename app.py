@@ -2,6 +2,7 @@ import os
 import sqlite3
 import datetime
 import hashlib
+import hmac
 import json
 import base64
 from typing import Optional, List
@@ -44,9 +45,16 @@ def hash_password(password: str, salt: Optional[str] = None) -> str:
 
 def verify_password(password: str, stored_hash: str) -> bool:
     try:
-        salt, _ = stored_hash.split('$')
-        return hashlib.compare_digest(hash_password(password, salt), stored_hash)
-    except Exception:
+        if '$' not in stored_hash:
+            return False
+        parts = stored_hash.split('$')
+        if len(parts) != 2:
+            return False
+        salt = parts[0]
+        computed = hash_password(password, salt)
+        return hmac.compare_digest(computed, stored_hash)
+    except Exception as e:
+        print("verify_password error:", e)
         return False
 
 def create_token(user_id: int, username: str, role: str) -> str:
