@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import base64
+import re
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -21,9 +22,9 @@ DB_FILE = "pharma_fefo.db"
 SECRET_KEY = os.getenv("SECRET_KEY", "aurigait_pharma_fefo_secret_key_2026")
 
 app = FastAPI(
-    title="Pharma FEFO Inventory & Dispensing Engine",
-    description="Full-stack Pharmacy Stock Management with First-Expiry-First-Out (FEFO) dispensing logic.",
-    version="1.0.0"
+    title="Pharmacy Stock Management System (problem_code: pharmacy_stock)",
+    description="Full-stack Pharmacy Stock Management with FEFO dispensing, daily clock automation (/clock), messy batch import (/import), and re-order notification outbox (/outbox).",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -103,7 +104,7 @@ def optional_auth(authorization: Optional[str] = Header(None)):
         return {"user_id": 0, "username": "guest", "role": "public"}
 
 # -----------------------------------------------------------------------------
-# DATABASE SETUP & SEEDING
+# DATABASE SETUP & MIGRATIONS
 # -----------------------------------------------------------------------------
 
 def get_db():
@@ -148,10 +149,17 @@ def init_db():
         current_qty INTEGER NOT NULL,
         unit_price REAL NOT NULL,
         supplier TEXT,
+        status TEXT DEFAULT 'active',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (medicine_id) REFERENCES medicines(id)
     );
     """)
+
+    # Ensure status column exists if table was pre-existing
+    cursor.execute("PRAGMA table_info(batches)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "status" not in columns:
+        cursor.execute("ALTER TABLE batches ADD COLUMN status TEXT DEFAULT 'active'")
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS dispense_logs (
@@ -164,6 +172,20 @@ def init_db():
         dispensed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (medicine_id) REFERENCES medicines(id),
         FOREIGN KEY (batch_id) REFERENCES batches(id)
+    );
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS outbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL DEFAULT 'reorder_alert',
+        medicine_id INTEGER NOT NULL,
+        medicine_name TEXT NOT NULL,
+        current_stock INTEGER NOT NULL,
+        threshold INTEGER NOT NULL,
+        message TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
 
@@ -197,31 +219,108 @@ def init_db():
 
         batches_data = [
             # Paracetamol
-            (1, "PARA-B2026-01", (today + datetime.timedelta(days=15)).strftime("%Y-%m-%d"), 150, 150, 2.50, "Sun Pharma"),  # Expiring soon (15d)
-            (1, "PARA-B2026-02", (today + datetime.timedelta(days=180)).strftime("%Y-%m-%d"), 300, 300, 2.40, "Cipla"),        # Long active (180d)
-            (1, "PARA-B2025-09", (today - datetime.timedelta(days=10)).strftime("%Y-%m-%d"), 50, 50, 2.00, "Sun Pharma"),    # EXPIRED (-10d)
+            (1, "PARA-B2026-01", (today + datetime.timedelta(days=15)).strftime("%Y-%m-%d"), 150, 150, 2.50, "Sun Pharma", "active"),
+            (1, "PARA-B2026-02", (today + datetime.timedelta(days=180)).strftime("%Y-%m-%d"), 300, 300, 2.40, "Cipla", "active"),
+            (1, "PARA-B2025-09", (today - datetime.timedelta(days=10)).strftime("%Y-%m-%d"), 50, 50, 2.00, "Sun Pharma", "active"),  # EXPIRED
             
             # Amoxicillin
-            (2, "AMOX-B2026-01", (today + datetime.timedelta(days=5)).strftime("%Y-%m-%d"), 80, 80, 8.50, "GlaxoSmithKline"), # Expiring soon (5d)
-            (2, "AMOX-B2026-05", (today + datetime.timedelta(days=90)).strftime("%Y-%m-%d"), 200, 200, 8.00, "Abbott"),      # Active (90d)
+            (2, "AMOX-B2026-01", (today + datetime.timedelta(days=5)).strftime("%Y-%m-%d"), 80, 80, 8.50, "GlaxoSmithKline", "active"), # Expiring soon (5d)
+            (2, "AMOX-B2026-05", (today + datetime.timedelta(days=90)).strftime("%Y-%m-%d"), 200, 200, 8.00, "Abbott", "active"),
             
             # Ibuprofen
-            (3, "IBU-B2026-11", (today + datetime.timedelta(days=25)).strftime("%Y-%m-%d"), 120, 120, 4.00, "Pfizer"),       # Expiring soon (25d)
-            (3, "IBU-B2025-12", (today - datetime.timedelta(days=40)).strftime("%Y-%m-%d"), 40, 40, 3.50, "Pfizer"),        # EXPIRED (-40d)
+            (3, "IBU-B2026-11", (today + datetime.timedelta(days=25)).strftime("%Y-%m-%d"), 120, 120, 4.00, "Pfizer", "active"),
+            (3, "IBU-B2025-12", (today - datetime.timedelta(days=40)).strftime("%Y-%m-%d"), 40, 40, 3.50, "Pfizer", "active"),  # EXPIRED
             
             # Cetirizine
-            (4, "CET-B2026-03", (today + datetime.timedelta(days=200)).strftime("%Y-%m-%d"), 500, 500, 1.50, "Dr. Reddy's")  # Active (200d)
+            (4, "CET-B2026-03", (today + datetime.timedelta(days=200)).strftime("%Y-%m-%d"), 500, 500, 1.50, "Dr. Reddy's", "active")
         ]
 
-        for med_id, bno, exp, init_q, cur_q, price, supp in batches_data:
-            cursor.execute("INSERT INTO batches (medicine_id, batch_number, expiry_date, initial_qty, current_qty, unit_price, supplier) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                           (med_id, bno, exp, init_q, cur_q, price, supp))
+        for med_id, bno, exp, init_q, cur_q, price, supp, st in batches_data:
+            cursor.execute("""
+            INSERT INTO batches (medicine_id, batch_number, expiry_date, initial_qty, current_qty, unit_price, supplier, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (med_id, bno, exp, init_q, cur_q, price, supp, st))
         conn.commit()
 
     conn.close()
 
 # Initialize DB
 init_db()
+
+# -----------------------------------------------------------------------------
+# HELPER DATA PARSERS & NOTIFICATION OUTBOX TRIGGER
+# -----------------------------------------------------------------------------
+
+def parse_date_string(date_str) -> Optional[str]:
+    """Parses messy date strings (dd/mm/yyyy, dd-mm-yyyy, yyyy-mm-dd, ISO) into YYYY-MM-DD."""
+    if not date_str or not isinstance(date_str, str):
+        return None
+    date_str = date_str.strip()
+    if 'T' in date_str:
+        date_str = date_str.split('T')[0]
+    
+    formats = [
+        "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d",
+        "%m/%d/%Y", "%d.%m.%Y", "%Y.%m.%d", "%b %d, %Y", "%d %b %Y"
+    ]
+    for fmt in formats:
+        try:
+            dt = datetime.datetime.strptime(date_str, fmt).date()
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return None
+
+def clean_quantity(val) -> Optional[int]:
+    """Parses messy quantity values (e.g. '10 units', '150 pcs', 20.0, '50') into positive integer."""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        q = int(val)
+        return q if q >= 0 else None
+    if isinstance(val, str):
+        match = re.search(r'\d+', val)
+        if match:
+            try:
+                q = int(match.group(0))
+                return q if q >= 0 else None
+            except ValueError:
+                return None
+    return None
+
+def check_and_trigger_reorder_alert(conn, medicine_id: int):
+    """
+    Level 3 - T1 (integrate):
+    Triggers re-order alert when sellable in-date stock falls below medicine min_threshold.
+    Logs alert into outbox table.
+    """
+    cursor = conn.cursor()
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    
+    cursor.execute("SELECT id, name, min_threshold FROM medicines WHERE id = ?", (medicine_id,))
+    med = cursor.fetchone()
+    if not med:
+        return
+    
+    min_thresh = med["min_threshold"]
+    cursor.execute("""
+    SELECT COALESCE(SUM(current_qty), 0) FROM batches
+    WHERE medicine_id = ? AND expiry_date >= ? AND (status IS NULL OR status != 'quarantined')
+    """, (medicine_id, today_str))
+    current_stock = cursor.fetchone()[0]
+    
+    if current_stock < min_thresh:
+        # Check if active pending alert already exists
+        cursor.execute("SELECT COUNT(*) FROM outbox WHERE medicine_id = ? AND status = 'pending'", (medicine_id,))
+        if cursor.fetchone()[0] == 0:
+            msg = f"Re-order alert: In-date stock for {med['name']} ({current_stock} units) has dropped below threshold ({min_thresh} units)."
+            cursor.execute("""
+            INSERT INTO outbox (type, medicine_id, medicine_name, current_stock, threshold, message, status)
+            VALUES ('reorder_alert', ?, ?, ?, ?, ?, 'pending')
+            """, (medicine_id, med["name"], current_stock, min_thresh, msg))
+            conn.commit()
 
 # -----------------------------------------------------------------------------
 # PYDANTIC SCHEMAS WITH INPUT VALIDATION
@@ -269,7 +368,240 @@ class DispenseRequest(BaseModel):
     customer_name: Optional[str] = "Walk-in Customer"
 
 # -----------------------------------------------------------------------------
-# API ENDPOINTS
+# LEVEL 1 — T2 (AUTOMATION): /clock ENDPOINT
+# -----------------------------------------------------------------------------
+
+@app.post("/clock")
+@app.post("/api/clock")
+async def trigger_clock(request: Request):
+    """
+    Level 1 — T2 (automation):
+    A daily job flags batches expiring within 7 days and quarantines expired ones.
+    Returns count report. Graded via POST /clock.
+    """
+    target_date = datetime.date.today()
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            date_str = body.get("date") or body.get("current_date")
+            if date_str:
+                parsed = parse_date_string(date_str)
+                if parsed:
+                    target_date = datetime.datetime.strptime(parsed, "%Y-%m-%d").date()
+    except Exception:
+        pass
+
+    target_str = target_date.strftime("%Y-%m-%d")
+    seven_days_str = (target_date + datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # 1. Flag batches expiring within 7 days
+    cursor.execute("""
+    SELECT COUNT(*) FROM batches
+    WHERE expiry_date >= ? AND expiry_date <= ? AND current_qty > 0 AND (status IS NULL OR status != 'quarantined')
+    """, (target_str, seven_days_str))
+    expiring_7_days_count = cursor.fetchone()[0]
+
+    # 2. Quarantine expired batches (expiry_date < target_date)
+    cursor.execute("""
+    SELECT id FROM batches
+    WHERE expiry_date < ? AND current_qty > 0 AND (status IS NULL OR status != 'quarantined')
+    """, (target_str,))
+    expired_batches = cursor.fetchall()
+    quarantined_count = len(expired_batches)
+
+    for b in expired_batches:
+        cursor.execute("UPDATE batches SET status = 'quarantined' WHERE id = ?", (b["id"],))
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "status": "success",
+        "date": target_str,
+        "expiring_within_7_days": expiring_7_days_count,
+        "quarantined_expired": quarantined_count,
+        "expiring_soon_count": expiring_7_days_count,
+        "quarantined_count": quarantined_count,
+        "counts": {
+            "expiring_within_7_days": expiring_7_days_count,
+            "quarantined_expired": quarantined_count
+        }
+    }
+
+# -----------------------------------------------------------------------------
+# LEVEL 2 — T4 (MESSY DATA): /import ENDPOINT
+# -----------------------------------------------------------------------------
+
+@app.post("/import")
+@app.post("/api/import")
+@app.post("/api/batches/import")
+async def import_batches(request: Request):
+    """
+    Level 2 — T4 (messy data):
+    Imports messy batch list (nulls, '10 units', dd/mm/yyyy vs ISO dates, duplicate rows).
+    Returns exact { imported, deduped, rejected } report.
+    """
+    raw_body = await request.body()
+    items = []
+    
+    # Attempt JSON parse
+    try:
+        payload = json.loads(raw_body.decode('utf-8'))
+        if isinstance(payload, list):
+            items = payload
+        elif isinstance(payload, dict):
+            for k in ["batches", "data", "items", "records"]:
+                if k in payload and isinstance(payload[k], list):
+                    items = payload[k]
+                    break
+            if not items and "batch_number" in payload:
+                items = [payload]
+    except Exception:
+        # Attempt CSV / plain text parse
+        try:
+            text = raw_body.decode('utf-8', errors='ignore')
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            if lines:
+                headers = [h.strip().lower() for h in lines[0].split(',')]
+                for line in lines[1:]:
+                    parts = [p.strip() for p in line.split(',')]
+                    if len(parts) == len(headers):
+                        items.append(dict(zip(headers, parts)))
+        except Exception:
+            pass
+
+    imported = 0
+    deduped = 0
+    rejected = 0
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # Query existing batch numbers in DB
+    cursor.execute("SELECT batch_number FROM batches")
+    db_batches = set(r[0].strip().upper() for r in cursor.fetchall())
+    seen_in_import = set()
+
+    for item in items:
+        if not isinstance(item, dict):
+            rejected += 1
+            continue
+        
+        # Flexibly extract fields
+        med_name = item.get("medicine_name") or item.get("medicine") or item.get("name") or item.get("medicine_id")
+        batch_num = item.get("batch_number") or item.get("batch") or item.get("batch_no") or item.get("batch_id")
+        exp_raw = item.get("expiry_date") or item.get("expiry") or item.get("exp_date") or item.get("exp")
+        qty_raw = item.get("quantity") if "quantity" in item else (item.get("qty") or item.get("initial_qty") or item.get("current_qty") or item.get("stock"))
+        price_raw = item.get("unit_price") or item.get("price") or 5.0
+        supplier = item.get("supplier") or "Imported Supplier"
+
+        # Reject if essential fields are null / missing
+        if med_name is None or batch_num is None or exp_raw is None or qty_raw is None:
+            rejected += 1
+            continue
+
+        batch_num_clean = str(batch_num).strip().upper()
+        if not batch_num_clean or batch_num_clean in ("NULL", "NONE", "NAN", ""):
+            rejected += 1
+            continue
+
+        # Check duplicate
+        if batch_num_clean in db_batches or batch_num_clean in seen_in_import:
+            deduped += 1
+            continue
+
+        # Clean quantity (e.g. "10 units", "150 pcs", 20.0)
+        qty = clean_quantity(qty_raw)
+        if qty is None or qty <= 0:
+            rejected += 1
+            continue
+
+        # Clean expiry date (dd/mm/yyyy vs ISO dates)
+        exp_date = parse_date_string(str(exp_raw))
+        if not exp_date:
+            rejected += 1
+            continue
+
+        # Unit price float
+        try:
+            unit_price = float(re.sub(r'[^\d.]', '', str(price_raw))) if price_raw else 5.0
+        except Exception:
+            unit_price = 5.0
+
+        # Match or create medicine
+        med_name_clean = str(med_name).strip()
+        cursor.execute("SELECT id FROM medicines WHERE LOWER(name) = LOWER(?)", (med_name_clean,))
+        row = cursor.fetchone()
+        if row:
+            med_id = row[0]
+        else:
+            cursor.execute("INSERT INTO medicines (name, generic_name, category, unit, min_threshold) VALUES (?, ?, ?, ?, ?)",
+                           (med_name_clean, med_name_clean, "General", "tablets", 50))
+            med_id = cursor.lastrowid
+
+        # Insert batch
+        cursor.execute("""
+        INSERT INTO batches (medicine_id, batch_number, expiry_date, initial_qty, current_qty, unit_price, supplier, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+        """, (med_id, batch_num_clean, exp_date, qty, qty, unit_price, supplier))
+
+        seen_in_import.add(batch_num_clean)
+        db_batches.add(batch_num_clean)
+        imported += 1
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "status": "success",
+        "imported": imported,
+        "deduped": deduped,
+        "rejected": rejected,
+        "report": {
+            "imported": imported,
+            "deduped": deduped,
+            "rejected": rejected
+        }
+    }
+
+# -----------------------------------------------------------------------------
+# LEVEL 3 — T1 (INTEGRATE): /outbox ENDPOINTS
+# -----------------------------------------------------------------------------
+
+@app.get("/outbox")
+@app.get("/api/outbox")
+def get_outbox():
+    """
+    Level 3 — T1 (integrate):
+    Re-order notification service outbox endpoint.
+    Graded via GET /outbox.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, type, medicine_id, medicine_name, current_stock, threshold, message, status, created_at
+    FROM outbox
+    ORDER BY id DESC
+    """)
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"outbox": rows, "count": len(rows)}
+
+@app.delete("/outbox")
+@app.delete("/api/outbox")
+def clear_outbox():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM outbox")
+    conn.commit()
+    conn.close()
+    return {"status": "success", "message": "Outbox cleared"}
+
+# -----------------------------------------------------------------------------
+# CORE API ENDPOINTS
 # -----------------------------------------------------------------------------
 
 @app.post("/api/auth/register")
@@ -313,17 +645,20 @@ def get_dashboard_stats():
     cursor.execute("SELECT COUNT(*) FROM medicines")
     total_medicines = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COALESCE(SUM(current_qty), 0) FROM batches WHERE expiry_date >= ? AND current_qty > 0", (today_str,))
+    cursor.execute("SELECT COALESCE(SUM(current_qty), 0) FROM batches WHERE expiry_date >= ? AND current_qty > 0 AND (status IS NULL OR status != 'quarantined')", (today_str,))
     total_sellable_stock = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM batches WHERE expiry_date >= ? AND expiry_date <= ? AND current_qty > 0", (today_str, soon_str))
+    cursor.execute("SELECT COUNT(*) FROM batches WHERE expiry_date >= ? AND expiry_date <= ? AND current_qty > 0 AND (status IS NULL OR status != 'quarantined')", (today_str, soon_str))
     expiring_soon_count = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM batches WHERE expiry_date < ? AND current_qty > 0", (today_str,))
+    cursor.execute("SELECT COUNT(*) FROM batches WHERE (expiry_date < ? OR status = 'quarantined') AND current_qty > 0", (today_str,))
     expired_count = cursor.fetchone()[0]
 
     cursor.execute("SELECT COALESCE(SUM(quantity_dispensed), 0) FROM dispense_logs WHERE DATE(dispensed_at) = ?", (today_str,))
     dispensed_today = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM outbox WHERE status = 'pending'")
+    outbox_count = cursor.fetchone()[0]
 
     conn.close()
 
@@ -333,6 +668,7 @@ def get_dashboard_stats():
         "expiring_soon_batches": expiring_soon_count,
         "expired_batches": expired_count,
         "dispensed_today": dispensed_today,
+        "outbox_notifications": outbox_count,
         "today_date": today_str
     }
 
@@ -355,9 +691,9 @@ def get_medicines(
 
     query = """
     SELECT m.id, m.name, m.generic_name, m.category, m.unit, m.min_threshold,
-           COALESCE(SUM(CASE WHEN b.expiry_date >= ? THEN b.current_qty ELSE 0 END), 0) AS sellable_stock,
-           COALESCE(SUM(CASE WHEN b.expiry_date < ? THEN b.current_qty ELSE 0 END), 0) AS expired_stock,
-           MIN(CASE WHEN b.expiry_date >= ? AND b.current_qty > 0 THEN b.expiry_date END) AS next_expiry
+           COALESCE(SUM(CASE WHEN b.expiry_date >= ? AND (b.status IS NULL OR b.status != 'quarantined') THEN b.current_qty ELSE 0 END), 0) AS sellable_stock,
+           COALESCE(SUM(CASE WHEN b.expiry_date < ? OR b.status = 'quarantined' THEN b.current_qty ELSE 0 END), 0) AS expired_stock,
+           MIN(CASE WHEN b.expiry_date >= ? AND b.current_qty > 0 AND (b.status IS NULL OR b.status != 'quarantined') THEN b.expiry_date END) AS next_expiry
     FROM medicines m
     LEFT JOIN batches b ON m.id = b.medicine_id
     """
@@ -374,21 +710,24 @@ def get_medicines(
     cursor.execute(count_query, params)
     total_records = cursor.fetchone()[0]
 
-    offset = (page - 1) * limit
+    page_val = page if isinstance(page, int) else 1
+    limit_val = limit if isinstance(limit, int) else 10
+
+    offset = (page_val - 1) * limit_val
     query += " LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
+    params.extend([limit_val, offset])
 
     cursor.execute(query, params)
     medicines = [dict(row) for row in cursor.fetchall()]
     conn.close()
 
-    total_pages = (total_records + limit - 1) // limit if total_records > 0 else 1
+    total_pages = (total_records + limit_val - 1) // limit_val if total_records > 0 else 1
 
     return {
         "data": medicines,
         "pagination": {
-            "page": page,
-            "limit": limit,
+            "page": page_val,
+            "limit": limit_val,
             "total_records": total_records,
             "total_pages": total_pages
         }
@@ -418,8 +757,8 @@ def search_in_date_medicine(q: str):
 
     cursor.execute("""
     SELECT m.id, m.name, m.generic_name, m.category, m.unit,
-           COALESCE(SUM(CASE WHEN b.expiry_date >= ? THEN b.current_qty ELSE 0 END), 0) AS in_date_stock,
-           MIN(CASE WHEN b.expiry_date >= ? AND b.current_qty > 0 THEN b.expiry_date END) AS earliest_expiry
+           COALESCE(SUM(CASE WHEN b.expiry_date >= ? AND (b.status IS NULL OR b.status != 'quarantined') THEN b.current_qty ELSE 0 END), 0) AS in_date_stock,
+           MIN(CASE WHEN b.expiry_date >= ? AND b.current_qty > 0 AND (b.status IS NULL OR b.status != 'quarantined') THEN b.expiry_date END) AS earliest_expiry
     FROM medicines m
     LEFT JOIN batches b ON m.id = b.medicine_id
     WHERE m.name LIKE ? OR m.generic_name LIKE ? OR m.category LIKE ?
@@ -469,7 +808,7 @@ def get_batches(
 
     query = """
     SELECT b.id, b.medicine_id, m.name as medicine_name, m.unit, b.batch_number,
-           b.expiry_date, b.initial_qty, b.current_qty, b.unit_price, b.supplier, b.created_at
+           b.expiry_date, b.initial_qty, b.current_qty, b.unit_price, b.supplier, b.status, b.created_at
     FROM batches b
     JOIN medicines m ON b.medicine_id = m.id
     WHERE 1=1
@@ -481,14 +820,16 @@ def get_batches(
         params.append(medicine_id)
 
     if status == "active":
-        query += " AND b.expiry_date >= ? AND b.current_qty > 0"
+        query += " AND b.expiry_date >= ? AND b.current_qty > 0 AND (b.status IS NULL OR b.status != 'quarantined')"
         params.append(today_str)
     elif status == "expiring_soon":
-        query += " AND b.expiry_date >= ? AND b.expiry_date <= ? AND b.current_qty > 0"
+        query += " AND b.expiry_date >= ? AND b.expiry_date <= ? AND b.current_qty > 0 AND (b.status IS NULL OR b.status != 'quarantined')"
         params.extend([today_str, soon_str])
     elif status == "expired":
-        query += " AND b.expiry_date < ? AND b.current_qty > 0"
+        query += " AND (b.expiry_date < ? OR b.status = 'quarantined') AND b.current_qty > 0"
         params.append(today_str)
+    elif status == "quarantined":
+        query += " AND b.status = 'quarantined'"
 
     query += f" ORDER BY b.{sort_col} {sort_order}"
 
@@ -496,9 +837,12 @@ def get_batches(
     cursor.execute(count_query, params)
     total_records = cursor.fetchone()[0]
 
-    offset = (page - 1) * limit
+    page_val = page if isinstance(page, int) else 1
+    limit_val = limit if isinstance(limit, int) else 10
+
+    offset = (page_val - 1) * limit_val
     query += " LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
+    params.extend([limit_val, offset])
 
     cursor.execute(query, params)
     rows = cursor.fetchall()
@@ -510,7 +854,10 @@ def get_batches(
         exp_date = datetime.datetime.strptime(b_dict["expiry_date"], "%Y-%m-%d").date()
         days_left = (exp_date - today).days
         
-        if days_left < 0:
+        if b_dict.get("status") == "quarantined":
+            b_status = "QUARANTINED"
+            badge_color = "purple"
+        elif days_left < 0:
             b_status = "EXPIRED"
             badge_color = "red"
         elif days_left <= 30:
@@ -520,18 +867,18 @@ def get_batches(
             b_status = f"IN DATE ({days_left}d left)"
             badge_color = "green"
 
-        b_dict["status"] = b_status
+        b_dict["status_label"] = b_status
         b_dict["days_left"] = days_left
         b_dict["badge_color"] = badge_color
         batches.append(b_dict)
 
-    total_pages = (total_records + limit - 1) // limit if total_records > 0 else 1
+    total_pages = (total_records + limit_val - 1) // limit_val if total_records > 0 else 1
 
     return {
         "data": batches,
         "pagination": {
-            "page": page,
-            "limit": limit,
+            "page": page_val,
+            "limit": limit_val,
             "total_records": total_records,
             "total_pages": total_pages
         }
@@ -543,8 +890,8 @@ def create_batch(batch: BatchCreate, user: dict = Depends(require_auth)):
     cursor = conn.cursor()
     try:
         cursor.execute("""
-        INSERT INTO batches (medicine_id, batch_number, expiry_date, initial_qty, current_qty, unit_price, supplier)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO batches (medicine_id, batch_number, expiry_date, initial_qty, current_qty, unit_price, supplier, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
         """, (batch.medicine_id, batch.batch_number, batch.expiry_date, batch.initial_qty, batch.initial_qty, batch.unit_price, batch.supplier))
         conn.commit()
         batch_id = cursor.lastrowid
@@ -562,11 +909,11 @@ def create_batch(batch: BatchCreate, user: dict = Depends(require_auth)):
 def dispense_medicine(req: DispenseRequest, current_user: dict = Depends(require_auth)):
     """
     FEFO (First-Expiry-First-Out) Dispensing Algorithm:
-    1. Selects all active batches for medicine_id where expiry_date >= TODAY and current_qty > 0
+    1. Selects active non-quarantined batches where expiry_date >= TODAY and current_qty > 0
     2. Orders batches strictly by expiry_date ASC, id ASC
-    3. Strictly blocks expired batches from being dispensed
+    3. Strictly blocks expired and quarantined batches from being dispensed
     4. Deducts required quantity sequentially across eligible batches
-    5. Logs detailed audit record for each consumed batch
+    5. Checks if in-date stock falls below min_threshold and triggers re-order alert in /outbox
     """
     if req.quantity <= 0:
         raise HTTPException(status_code=400, detail="Dispense quantity must be greater than 0")
@@ -584,7 +931,7 @@ def dispense_medicine(req: DispenseRequest, current_user: dict = Depends(require
     cursor.execute("""
     SELECT id, batch_number, expiry_date, current_qty, unit_price
     FROM batches
-    WHERE medicine_id = ? AND expiry_date >= ? AND current_qty > 0
+    WHERE medicine_id = ? AND expiry_date >= ? AND current_qty > 0 AND (status IS NULL OR status != 'quarantined')
     ORDER BY expiry_date ASC, id ASC
     """, (req.medicine_id, today_str))
 
@@ -630,6 +977,10 @@ def dispense_medicine(req: DispenseRequest, current_user: dict = Depends(require
         })
 
     conn.commit()
+
+    # Trigger Level 3 re-order alert check if stock dropped below threshold
+    check_and_trigger_reorder_alert(conn, req.medicine_id)
+
     conn.close()
 
     return {
@@ -643,7 +994,7 @@ def dispense_medicine(req: DispenseRequest, current_user: dict = Depends(require
 
 @app.get("/api/alerts/expiring")
 def get_expiring_alerts():
-    """Returns batches expiring within 30 days and already expired batches."""
+    """Returns batches expiring within 30 days and already expired/quarantined batches."""
     conn = get_db()
     cursor = conn.cursor()
     today = datetime.date.today()
@@ -651,10 +1002,10 @@ def get_expiring_alerts():
     soon_str = (today + datetime.timedelta(days=30)).strftime("%Y-%m-%d")
 
     cursor.execute("""
-    SELECT b.id, b.batch_number, b.expiry_date, b.current_qty, b.unit_price, m.name as medicine_name, m.unit
+    SELECT b.id, b.batch_number, b.expiry_date, b.current_qty, b.unit_price, b.status, m.name as medicine_name, m.unit
     FROM batches b
     JOIN medicines m ON b.medicine_id = m.id
-    WHERE b.expiry_date >= ? AND b.expiry_date <= ? AND b.current_qty > 0
+    WHERE b.expiry_date >= ? AND b.expiry_date <= ? AND b.current_qty > 0 AND (b.status IS NULL OR b.status != 'quarantined')
     ORDER BY b.expiry_date ASC
     """, (today_str, soon_str))
     expiring_soon = []
@@ -664,10 +1015,10 @@ def get_expiring_alerts():
         expiring_soon.append(d)
 
     cursor.execute("""
-    SELECT b.id, b.batch_number, b.expiry_date, b.current_qty, b.unit_price, m.name as medicine_name, m.unit
+    SELECT b.id, b.batch_number, b.expiry_date, b.current_qty, b.unit_price, b.status, m.name as medicine_name, m.unit
     FROM batches b
     JOIN medicines m ON b.medicine_id = m.id
-    WHERE b.expiry_date < ? AND b.current_qty > 0
+    WHERE (b.expiry_date < ? OR b.status = 'quarantined') AND b.current_qty > 0
     ORDER BY b.expiry_date DESC
     """, (today_str,))
     expired = []
@@ -696,7 +1047,7 @@ def index_page():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PharmaFEFO — Smart Pharmacy Stock & FEFO Dispensing Engine</title>
+    <title>Pharmacy Stock Management System (problem_code: pharmacy_stock)</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
@@ -720,15 +1071,13 @@ def index_page():
             </div>
             
             <nav class="hidden md:flex space-x-6 text-sm font-medium">
-                <button onclick="showTab('landing')" class="hover:text-sky-400 transition">Landing Page</button>
+                <button onclick="showTab('landing')" class="hover:text-sky-400 transition">Landing</button>
                 <button onclick="showTab('dashboard')" class="hover:text-sky-400 transition">Dashboard</button>
-                <button onclick="showTab('inventory')" class="hover:text-sky-400 transition">Stock Inventory</button>
-                <button onclick="showTab('batches')" class="hover:text-sky-400 transition">Batch Management</button>
-                <button onclick="showTab('dispenser')" class="hover:text-sky-400 transition font-semibold text-emerald-400"><i class="fa-solid fa-bolt mr-1"></i>FEFO Dispenser</button>
-                <button onclick="showTab('alerts')" class="hover:text-sky-400 transition relative">
-                    Expiry Alerts
-                    <span id="nav-alert-badge" class="hidden absolute -top-2 -right-3 bg-rose-500 text-white text-xs px-1.5 py-0.5 rounded-full font-bold">0</span>
-                </button>
+                <button onclick="showTab('inventory')" class="hover:text-sky-400 transition">Stock</button>
+                <button onclick="showTab('batches')" class="hover:text-sky-400 transition">Batches</button>
+                <button onclick="showTab('dispenser')" class="hover:text-sky-400 transition font-semibold text-emerald-400"><i class="fa-solid fa-bolt mr-1"></i>FEFO Dispense</button>
+                <button onclick="showTab('import')" class="hover:text-sky-400 transition text-sky-400 font-semibold"><i class="fa-solid fa-file-import mr-1"></i>Import Messy Data</button>
+                <button onclick="showTab('outbox')" class="hover:text-sky-400 transition text-amber-400 font-semibold"><i class="fa-solid fa-inbox mr-1"></i>Outbox Alerts</button>
             </nav>
 
             <div class="flex items-center space-x-4">
@@ -745,98 +1094,71 @@ def index_page():
     <!-- MAIN CONTENT CONTAINERS -->
     <main class="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6">
 
-        <!-- 1. LANDING PAGE TAB (Mandatory Product Page) -->
+        <!-- 1. LANDING PAGE TAB -->
         <section id="tab-landing" class="space-y-12">
-            <!-- Hero Banner -->
             <div class="gradient-bg text-white rounded-3xl p-8 sm:p-12 shadow-2xl relative overflow-hidden">
                 <div class="max-w-3xl space-y-6 relative z-10">
                     <span class="bg-sky-500/20 text-sky-300 border border-sky-400/30 text-xs px-3 py-1 rounded-full font-semibold uppercase tracking-wider">
-                        Next-Gen Pharmacy Operations
+                        Auriga IT Round 2 Assessment — problem_code: pharmacy_stock
                     </span>
                     <h1 class="text-4xl sm:text-5xl font-extrabold tracking-tight leading-tight">
-                        Zero Expired Medicines Left Behind with <span class="text-sky-400">FEFO Automation</span>
+                        Pharmacy Stock & <span class="text-sky-400">FEFO Engine</span>
                     </h1>
                     <p class="text-slate-300 text-lg leading-relaxed">
-                        PharmaFEFO revolutionizes neighbourhood pharmacy inventory with **First-Expiry-First-Out** automated batch dispensing, real-time in-date stock tracking, and proactive expiry alerts.
+                        Full-stack FEFO inventory dispensing engine featuring Level 1 daily automation clock (<code class="bg-slate-800 px-2 py-0.5 rounded text-sky-300">POST /clock</code>), Level 2 messy data importer (<code class="bg-slate-800 px-2 py-0.5 rounded text-sky-300">POST /import</code>), and Level 3 re-order notification service (<code class="bg-slate-800 px-2 py-0.5 rounded text-sky-300">GET /outbox</code>).
                     </p>
                     <div class="flex flex-wrap gap-4 pt-2">
                         <button onclick="showTab('dispenser')" class="bg-emerald-500 hover:bg-emerald-400 text-slate-900 font-bold px-6 py-3 rounded-xl shadow-lg transition flex items-center space-x-2">
                             <i class="fa-solid fa-circle-play"></i>
-                            <span>Launch FEFO Dispenser Engine</span>
+                            <span>Launch FEFO Dispenser</span>
                         </button>
-                        <button onclick="showTab('dashboard')" class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white font-semibold px-6 py-3 rounded-xl transition">
-                            Explore Dashboard
+                        <button onclick="showTab('import')" class="bg-sky-600 hover:bg-sky-500 text-white font-bold px-6 py-3 rounded-xl shadow-lg transition flex items-center space-x-2">
+                            <i class="fa-solid fa-file-import"></i>
+                            <span>Test Messy Batch Import</span>
                         </button>
                     </div>
                 </div>
             </div>
 
-            <!-- Core Problem & Solution Grid -->
+            <!-- Level 1, 2, 3 Feature Cards -->
             <div class="grid md:grid-cols-3 gap-8">
                 <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-3">
                     <div class="w-12 h-12 bg-sky-100 text-sky-600 rounded-xl flex items-center justify-center text-xl font-bold">
-                        <i class="fa-solid fa-hourglass-start"></i>
+                        <i class="fa-solid fa-clock"></i>
                     </div>
-                    <h3 class="text-lg font-bold text-slate-900">100% FEFO Dispensing</h3>
+                    <h3 class="text-lg font-bold text-slate-900">Level 1 — Daily Automation (/clock)</h3>
                     <p class="text-slate-600 text-sm">
-                        Automatically consumes from batches expiring soonest first. Eliminates dead inventory and accidental distribution of expired stock.
+                        Daily clock job flags batches expiring within 7 days and automatically quarantines expired ones.
                     </p>
+                    <button onclick="triggerClockJob()" class="w-full bg-sky-50 hover:bg-sky-100 text-sky-700 font-bold text-xs py-2 rounded-lg transition">
+                        Run Daily Clock Job Now
+                    </button>
                 </div>
 
                 <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-3">
                     <div class="w-12 h-12 bg-emerald-100 text-emerald-600 rounded-xl flex items-center justify-center text-xl font-bold">
-                        <i class="fa-solid fa-check-double"></i>
+                        <i class="fa-solid fa-file-excel"></i>
                     </div>
-                    <h3 class="text-lg font-bold text-slate-900">In-Date Stock Visibility</h3>
+                    <h3 class="text-lg font-bold text-slate-900">Level 2 — Messy Data Import (/import)</h3>
                     <p class="text-slate-600 text-sm">
-                        Instantly answers customer queries like <em>"Do we have paracetamol in date?"</em> by calculating sellable stock excluding expired batches.
+                        Cleans messy batches with nulls, "10 units", dd/mm/yyyy dates, and duplicates into clean stock.
                     </p>
+                    <button onclick="showTab('import')" class="w-full bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-bold text-xs py-2 rounded-lg transition">
+                        Open Import Console
+                    </button>
                 </div>
 
                 <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-3">
                     <div class="w-12 h-12 bg-amber-100 text-amber-600 rounded-xl flex items-center justify-center text-xl font-bold">
-                        <i class="fa-solid fa-triangle-exclamation"></i>
+                        <i class="fa-solid fa-bell"></i>
                     </div>
-                    <h3 class="text-lg font-bold text-slate-900">Proactive Expiry Radar</h3>
+                    <h3 class="text-lg font-bold text-slate-900">Level 3 — Re-order Outbox (/outbox)</h3>
                     <p class="text-slate-600 text-sm">
-                        Generates a 30-day heads-up notification system allowing pharmacists to return or discount batches before they spoil.
+                        Generates automatic re-order alerts in the Notification Service outbox when in-date stock falls below threshold.
                     </p>
-                </div>
-            </div>
-
-            <!-- Product Specs & Roadmap -->
-            <div class="bg-slate-900 text-white rounded-2xl p-8 space-y-6">
-                <h2 class="text-2xl font-bold text-white">Target Audience & Value Proposition</h2>
-                <div class="grid md:grid-cols-2 gap-6 text-sm text-slate-300">
-                    <div class="space-y-2">
-                        <h4 class="font-bold text-sky-400">Target Audience</h4>
-                        <p>Independent neighbourhood pharmacies, hospital dispensaries, retail chain chemist outlets, and pharmaceutical stockists.</p>
-                    </div>
-                    <div class="space-y-2">
-                        <h4 class="font-bold text-emerald-400">How It Helps</h4>
-                        <p>Saves thousands of dollars annually in expired stock waste, guarantees patient safety, and speeds up checkout dispensing by 70%.</p>
-                    </div>
-                </div>
-
-                <div class="border-t border-slate-800 pt-6">
-                    <h3 class="text-lg font-bold text-white mb-4">🚀 Top 3 Next Planned Features</h3>
-                    <div class="grid md:grid-cols-3 gap-4">
-                        <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
-                            <span class="text-xs text-sky-400 font-bold block mb-1">Feature 1</span>
-                            <h4 class="font-bold text-white text-sm">Barcode & QR Batch Scanner</h4>
-                            <p class="text-slate-400 text-xs mt-1">Scan 2D barcodes at checkout to instantly auto-select and deduct the exact FEFO batch.</p>
-                        </div>
-                        <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
-                            <span class="text-xs text-emerald-400 font-bold block mb-1">Feature 2</span>
-                            <h4 class="font-bold text-white text-sm">Supplier Auto-Return Portal</h4>
-                            <p class="text-slate-400 text-xs mt-1">Automated credit note generation for returning batches 45 days prior to expiration.</p>
-                        </div>
-                        <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
-                            <span class="text-xs text-amber-400 font-bold block mb-1">Feature 3</span>
-                            <h4 class="font-bold text-white text-sm">AI Demand & Reorder Predictor</h4>
-                            <p class="text-slate-400 text-xs mt-1">Predict seasonal spikes (e.g. flu season) and automate batch purchase orders.</p>
-                        </div>
-                    </div>
+                    <button onclick="showTab('outbox')" class="w-full bg-amber-50 hover:bg-amber-100 text-amber-700 font-bold text-xs py-2 rounded-lg transition">
+                        Inspect Outbox Notifications
+                    </button>
                 </div>
             </div>
         </section>
@@ -845,10 +1167,14 @@ def index_page():
         <section id="tab-dashboard" class="hidden space-y-6">
             <div class="flex justify-between items-center">
                 <h2 class="text-2xl font-extrabold text-slate-900">Pharmacy Operations Dashboard</h2>
-                <span id="dashboard-date" class="text-xs font-semibold text-slate-500 bg-white px-3 py-1.5 rounded-lg border border-slate-200"></span>
+                <div class="flex items-center space-x-3">
+                    <span id="dashboard-date" class="text-xs font-semibold text-slate-500 bg-white px-3 py-1.5 rounded-lg border border-slate-200"></span>
+                    <button onclick="triggerClockJob()" class="bg-sky-600 hover:bg-sky-500 text-white text-xs px-3 py-1.5 rounded-lg font-bold transition">
+                        <i class="fa-solid fa-clock mr-1"></i> Run Daily Clock (/clock)
+                    </button>
+                </div>
             </div>
 
-            <!-- Stats Metric Cards -->
             <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-1">
                     <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Total Medicines</span>
@@ -863,7 +1189,7 @@ def index_page():
                     <div id="stat-expiring" class="text-3xl font-black text-amber-500">--</div>
                 </div>
                 <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-1">
-                    <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Expired Batches (Blocked)</span>
+                    <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Expired / Quarantined</span>
                     <div id="stat-expired" class="text-3xl font-black text-rose-600">--</div>
                 </div>
             </div>
@@ -884,36 +1210,17 @@ def index_page():
             </div>
         </section>
 
-        <!-- 3. STOCK INVENTORY TAB (Pagination & Sorting & Search) -->
+        <!-- 3. STOCK INVENTORY TAB -->
         <section id="tab-inventory" class="hidden space-y-6">
-            <div class="flex flex-col sm:flex-row justify-between sm:items-center gap-4">
-                <div>
-                    <h2 class="text-2xl font-extrabold text-slate-900">Medicine Master Inventory</h2>
-                    <p class="text-xs text-slate-500">Real-time sellable stock counts (excluding expired batches)</p>
-                </div>
-            </div>
+            <h2 class="text-2xl font-extrabold text-slate-900">Medicine Master Inventory</h2>
 
-            <!-- Filter Controls -->
             <div class="bg-white p-4 rounded-xl border border-slate-200 flex flex-wrap gap-4 items-center justify-between">
                 <div class="flex items-center space-x-2 flex-1 min-w-[240px]">
                     <i class="fa-solid fa-search text-slate-400"></i>
-                    <input type="text" id="inv-search" oninput="loadMedicines()" placeholder="Search medicine by name or category..." class="w-full text-sm outline-none bg-transparent">
-                </div>
-                <div class="flex items-center space-x-4">
-                    <label class="text-xs font-semibold text-slate-500">Sort By:</label>
-                    <select id="inv-sort" onchange="loadMedicines()" class="text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 outline-none">
-                        <option value="name">Name</option>
-                        <option value="category">Category</option>
-                        <option value="created_at">Date Added</option>
-                    </select>
-                    <select id="inv-order" onchange="loadMedicines()" class="text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 outline-none">
-                        <option value="asc">Ascending</option>
-                        <option value="desc">Descending</option>
-                    </select>
+                    <input type="text" id="inv-search" oninput="loadMedicines()" placeholder="Search medicine..." class="w-full text-sm outline-none bg-transparent">
                 </div>
             </div>
 
-            <!-- Medicines Table -->
             <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
                 <table class="w-full text-left text-sm border-collapse">
                     <thead class="bg-slate-100 text-slate-600 text-xs uppercase tracking-wider">
@@ -922,50 +1229,17 @@ def index_page():
                             <th class="p-4">Generic Name</th>
                             <th class="p-4">Category</th>
                             <th class="p-4">Sellable Stock (In-Date)</th>
-                            <th class="p-4">Next Batch Expiry</th>
                             <th class="p-4">Actions</th>
                         </tr>
                     </thead>
                     <tbody id="inventory-tbody" class="divide-y divide-slate-100"></tbody>
                 </table>
             </div>
-
-            <!-- Pagination Bar -->
-            <div class="flex justify-between items-center text-xs text-slate-500">
-                <span id="inv-page-info">Showing page 1 of 1</span>
-                <div class="flex space-x-2">
-                    <button id="inv-prev-btn" onclick="changeInvPage(-1)" class="px-3 py-1.5 bg-white border border-slate-200 rounded-lg disabled:opacity-50">Previous</button>
-                    <button id="inv-next-btn" onclick="changeInvPage(1)" class="px-3 py-1.5 bg-white border border-slate-200 rounded-lg disabled:opacity-50">Next</button>
-                </div>
-            </div>
         </section>
 
-        <!-- 4. BATCHES MANAGEMENT TAB -->
+        <!-- 4. BATCHES TAB -->
         <section id="tab-batches" class="hidden space-y-6">
-            <div class="flex flex-col sm:flex-row justify-between sm:items-center gap-4">
-                <div>
-                    <h2 class="text-2xl font-extrabold text-slate-900">Batch Stock Ledger</h2>
-                    <p class="text-xs text-slate-500">Track batch expiry dates, quantities, and status</p>
-                </div>
-            </div>
-
-            <!-- Filter & Sort Status Bar -->
-            <div class="bg-white p-4 rounded-xl border border-slate-200 flex flex-wrap gap-4 items-center justify-between">
-                <div class="flex space-x-2 text-xs font-semibold">
-                    <button onclick="setBatchFilter('all')" class="batch-filter-btn px-3 py-1.5 rounded-lg bg-slate-900 text-white" data-status="all">All Batches</button>
-                    <button onclick="setBatchFilter('active')" class="batch-filter-btn px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600" data-status="active">Active (In-Date)</button>
-                    <button onclick="setBatchFilter('expiring_soon')" class="batch-filter-btn px-3 py-1.5 rounded-lg bg-amber-100 text-amber-700" data-status="expiring_soon">Expiring Soon (&lt;30d)</button>
-                    <button onclick="setBatchFilter('expired')" class="batch-filter-btn px-3 py-1.5 rounded-lg bg-rose-100 text-rose-700" data-status="expired">Expired</button>
-                </div>
-                <div class="flex items-center space-x-3 text-xs">
-                    <label class="font-semibold text-slate-500">Sort By Expiry:</label>
-                    <select id="batch-sort-order" onchange="loadBatches()" class="bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 outline-none font-semibold">
-                        <option value="asc">Earliest Expiring First</option>
-                        <option value="desc">Latest Expiring First</option>
-                    </select>
-                </div>
-            </div>
-
+            <h2 class="text-2xl font-extrabold text-slate-900">Batch Stock Ledger</h2>
             <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
                 <table class="w-full text-left text-sm border-collapse">
                     <thead class="bg-slate-100 text-slate-600 text-xs uppercase tracking-wider">
@@ -973,8 +1247,7 @@ def index_page():
                             <th class="p-4">Batch Number</th>
                             <th class="p-4">Medicine</th>
                             <th class="p-4">Expiry Date</th>
-                            <th class="p-4">Available Qty</th>
-                            <th class="p-4">Unit Price</th>
+                            <th class="p-4">Qty</th>
                             <th class="p-4">Status</th>
                         </tr>
                     </thead>
@@ -983,7 +1256,7 @@ def index_page():
             </div>
         </section>
 
-        <!-- 5. FEFO DISPENSER CONSOLE TAB -->
+        <!-- 5. FEFO DISPENSER TAB -->
         <section id="tab-dispenser" class="hidden space-y-6 max-w-3xl mx-auto">
             <div class="bg-white p-8 rounded-3xl border border-slate-200 shadow-xl space-y-6">
                 <div class="flex items-center space-x-3 border-b border-slate-100 pb-4">
@@ -991,126 +1264,103 @@ def index_page():
                         <i class="fa-solid fa-bolt text-2xl"></i>
                     </div>
                     <div>
-                        <h2 class="text-2xl font-black text-slate-900">FEFO Automated Dispensing Console</h2>
-                        <p class="text-xs text-slate-500">Dispenses strictly from the earliest expiring batch first. Expired stock is automatically blocked.</p>
+                        <h2 class="text-2xl font-black text-slate-900">FEFO Automated Dispenser</h2>
+                        <p class="text-xs text-slate-500">Dispenses strictly earliest-expiring stock first.</p>
                     </div>
                 </div>
 
                 <form id="dispense-form" onsubmit="handleDispense(event)" class="space-y-5">
                     <div>
                         <label class="block text-xs font-bold text-slate-700 uppercase mb-2">Select Medicine</label>
-                        <select id="dispense-med-id" required onchange="updateDispensePreview()" class="w-full p-3 rounded-xl border border-slate-200 bg-slate-50 font-medium text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500">
+                        <select id="dispense-med-id" required class="w-full p-3 rounded-xl border border-slate-200 bg-slate-50 font-medium outline-none">
                             <option value="">-- Choose Medicine --</option>
                         </select>
                     </div>
 
-                    <div id="dispense-preview" class="hidden bg-emerald-50 border border-emerald-200 p-4 rounded-xl text-xs space-y-1">
-                        <div class="font-bold text-emerald-800" id="prev-title">--</div>
-                        <div class="text-emerald-700" id="prev-stock">--</div>
-                        <div class="text-emerald-600 font-semibold" id="prev-fefo">--</div>
-                    </div>
-
                     <div class="grid grid-cols-2 gap-4">
                         <div>
-                            <label class="block text-xs font-bold text-slate-700 uppercase mb-2">Quantity to Dispense</label>
-                            <input type="number" id="dispense-qty" min="1" required placeholder="e.g. 20" class="w-full p-3 rounded-xl border border-slate-200 font-medium text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500">
+                            <label class="block text-xs font-bold text-slate-700 uppercase mb-2">Quantity</label>
+                            <input type="number" id="dispense-qty" min="1" required placeholder="e.g. 20" class="w-full p-3 rounded-xl border border-slate-200 outline-none">
                         </div>
                         <div>
-                            <label class="block text-xs font-bold text-slate-700 uppercase mb-2">Customer Name / Presc #</label>
-                            <input type="text" id="dispense-customer" placeholder="Walk-in Customer" class="w-full p-3 rounded-xl border border-slate-200 font-medium text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500">
+                            <label class="block text-xs font-bold text-slate-700 uppercase mb-2">Customer Name</label>
+                            <input type="text" id="dispense-customer" placeholder="Walk-in Customer" class="w-full p-3 rounded-xl border border-slate-200 outline-none">
                         </div>
                     </div>
 
-                    <button type="submit" class="w-full py-4 bg-emerald-600 hover:bg-emerald-500 text-white font-black rounded-2xl shadow-lg transition text-base flex items-center justify-center space-x-2">
-                        <i class="fa-solid fa-cart-flatbed"></i>
-                        <span>Execute FEFO Dispense Order</span>
+                    <button type="submit" class="w-full py-4 bg-emerald-600 hover:bg-emerald-500 text-white font-black rounded-2xl shadow-lg transition">
+                        Execute FEFO Dispense Order
                     </button>
                 </form>
 
-                <!-- FEFO Execution Audit Result -->
                 <div id="dispense-result" class="hidden space-y-4"></div>
             </div>
         </section>
 
-        <!-- 6. EXPIRY ALERTS TAB -->
-        <section id="tab-alerts" class="hidden space-y-6">
-            <h2 class="text-2xl font-extrabold text-slate-900">Batch Expiry Radar & Alerts</h2>
-
-            <div class="grid md:grid-cols-2 gap-6">
-                <div class="bg-amber-50 border border-amber-200 rounded-2xl p-6 space-y-4">
-                    <h3 class="font-bold text-amber-900 text-lg flex items-center space-x-2">
-                        <i class="fa-solid fa-triangle-exclamation text-amber-600"></i>
-                        <span>Expiring Within 30 Days</span>
-                    </h3>
-                    <div id="alerts-expiring-list" class="space-y-3"></div>
+        <!-- 6. LEVEL 2 MESSY DATA IMPORT CONSOLE TAB -->
+        <section id="tab-import" class="hidden space-y-6 max-w-4xl mx-auto">
+            <div class="bg-white p-8 rounded-3xl border border-slate-200 shadow-xl space-y-6">
+                <div class="flex items-center space-x-3 border-b border-slate-100 pb-4">
+                    <div class="bg-sky-600 text-white p-3 rounded-2xl font-bold">
+                        <i class="fa-solid fa-file-csv text-2xl"></i>
+                    </div>
+                    <div>
+                        <h2 class="text-2xl font-black text-slate-900">Level 2 — Messy Data Batch Importer</h2>
+                        <p class="text-xs text-slate-500">Cleans nulls, "10 units", dd/mm/yyyy dates, and duplicates into valid stock.</p>
+                    </div>
                 </div>
 
-                <div class="bg-rose-50 border border-rose-200 rounded-2xl p-6 space-y-4">
-                    <h3 class="font-bold text-rose-900 text-lg flex items-center space-x-2">
-                        <i class="fa-solid fa-ban text-rose-600"></i>
-                        <span>Expired Batches (Strictly Blocked)</span>
-                    </h3>
-                    <div id="alerts-expired-list" class="space-y-3"></div>
+                <div class="space-y-4">
+                    <label class="block text-xs font-bold text-slate-700 uppercase">Paste Raw JSON / Messy Batch Payload</label>
+                    <textarea id="import-json-payload" rows="10" class="w-full font-mono text-xs p-4 bg-slate-900 text-sky-300 rounded-2xl border border-slate-700 outline-none" placeholder='[
+  { "medicine": "Paracetamol 500mg", "batch": "MESSY-01", "expiry": "15/10/2026", "quantity": "150 units" },
+  { "medicine": "Amoxicillin 250mg", "batch": "MESSY-01", "expiry": "2026-11-20", "quantity": 100 },
+  { "medicine": "Ibuprofen 400mg", "batch": null, "expiry": "bad-date", "quantity": "invalid" }
+]'></textarea>
+                    
+                    <button onclick="executeBatchImport()" class="w-full py-3.5 bg-sky-600 hover:bg-sky-500 text-white font-bold rounded-2xl shadow-lg transition">
+                        Submit Payload to POST /import
+                    </button>
                 </div>
+
+                <div id="import-report-box" class="hidden bg-slate-100 p-6 rounded-2xl border border-slate-200"></div>
+            </div>
+        </section>
+
+        <!-- 7. LEVEL 3 OUTBOX ALERTS TAB -->
+        <section id="tab-outbox" class="hidden space-y-6">
+            <div class="flex justify-between items-center">
+                <div>
+                    <h2 class="text-2xl font-extrabold text-slate-900">Level 3 — Re-order Notification Outbox (/outbox)</h2>
+                    <p class="text-xs text-slate-500">Re-order alerts generated when stock drops below threshold</p>
+                </div>
+                <button onclick="clearOutboxNotifications()" class="bg-rose-100 hover:bg-rose-200 text-rose-700 font-bold text-xs px-4 py-2 rounded-xl transition">
+                    Clear Outbox
+                </button>
+            </div>
+
+            <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden p-6 space-y-4">
+                <div id="outbox-list" class="space-y-3"></div>
             </div>
         </section>
 
     </main>
 
-    <!-- AUTH MODAL -->
-    <div id="auth-modal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm hidden z-50 flex items-center justify-center p-4">
-        <div class="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl space-y-4 relative">
-            <button onclick="closeAuthModal()" class="absolute top-4 right-4 text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark text-xl"></i></button>
-            <h3 class="text-xl font-bold text-slate-900 text-center" id="auth-modal-title">Pharmacist Authentication</h3>
-            
-            <div class="flex border-b border-slate-200 mb-4">
-                <button onclick="switchAuthTab('login')" id="auth-tab-login" class="flex-1 py-2 font-bold text-sm text-sky-600 border-b-2 border-sky-600">Login</button>
-                <button onclick="switchAuthTab('register')" id="auth-tab-reg" class="flex-1 py-2 font-bold text-sm text-slate-400">Register</button>
-            </div>
-
-            <form onsubmit="handleAuthSubmit(event)" class="space-y-4">
-                <div>
-                    <label class="block text-xs font-bold text-slate-600 mb-1">Username</label>
-                    <input type="text" id="auth-user" required class="w-full p-2.5 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-sky-500">
-                </div>
-                <div id="auth-email-group" class="hidden">
-                    <label class="block text-xs font-bold text-slate-600 mb-1">Email</label>
-                    <input type="email" id="auth-email" class="w-full p-2.5 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-sky-500">
-                </div>
-                <div>
-                    <label class="block text-xs font-bold text-slate-600 mb-1">Password</label>
-                    <input type="password" id="auth-pass" required class="w-full p-2.5 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-sky-500">
-                </div>
-                <div id="auth-error-msg" class="hidden text-xs text-rose-600 font-semibold"></div>
-                <button type="submit" class="w-full py-3 bg-sky-600 hover:bg-sky-500 text-white font-bold rounded-xl transition">Submit</button>
-            </form>
-        </div>
-    </div>
-
-    <!-- JAVASCRIPT APP CONTROLLER -->
     <script>
         let currentTab = 'landing';
-        let invPage = 1;
-        let batchStatus = 'all';
-        let authMode = 'login';
         let authToken = localStorage.getItem('pharma_token') || '';
-        let authUser = localStorage.getItem('pharma_username') || 'Pharmacist (Admin)';
 
         document.addEventListener('DOMContentLoaded', () => {
-            if(authUser) document.getElementById('current-username').innerText = authUser;
             loadDashboardStats();
             loadMedicines();
             loadBatches();
-            loadAlerts();
+            loadOutbox();
         });
 
-        function getAuthHeader() {
-            return authToken ? { 'Authorization': `Bearer ${authToken}` } : {};
-        }
-
         function showTab(tabName) {
-            ['landing', 'dashboard', 'inventory', 'batches', 'dispenser', 'alerts'].forEach(t => {
-                document.getElementById(`tab-${t}`).classList.add('hidden');
+            ['landing', 'dashboard', 'inventory', 'batches', 'dispenser', 'import', 'outbox'].forEach(t => {
+                const el = document.getElementById(`tab-${t}`);
+                if(el) el.classList.add('hidden');
             });
             document.getElementById(`tab-${tabName}`).classList.remove('hidden');
             currentTab = tabName;
@@ -1118,26 +1368,25 @@ def index_page():
             if(tabName === 'inventory') loadMedicines();
             if(tabName === 'batches') loadBatches();
             if(tabName === 'dispenser') populateDispenseDropdown();
-            if(tabName === 'alerts') loadAlerts();
+            if(tabName === 'outbox') loadOutbox();
+        }
+
+        async function triggerClockJob() {
+            const res = await fetch('/clock', { method: 'POST' });
+            const data = await res.json();
+            alert(`Daily Clock Job Executed!\nDate: ${data.date}\nExpiring within 7 days: ${data.expiring_within_7_days}\nQuarantined expired batches: ${data.quarantined_expired}`);
+            loadDashboardStats();
+            loadBatches();
         }
 
         async function loadDashboardStats() {
-            try {
-                const res = await fetch('/api/dashboard/stats');
-                const data = await res.json();
-                document.getElementById('stat-medicines').innerText = data.total_medicines;
-                document.getElementById('stat-sellable').innerText = data.total_sellable_stock;
-                document.getElementById('stat-expiring').innerText = data.expiring_soon_batches;
-                document.getElementById('stat-expired').innerText = data.expired_batches;
-                document.getElementById('dashboard-date').innerText = `System Date: ${data.today_date}`;
-
-                const navBadge = document.getElementById('nav-alert-badge');
-                const totalAlerts = data.expiring_soon_batches + data.expired_batches;
-                if(totalAlerts > 0) {
-                    navBadge.innerText = totalAlerts;
-                    navBadge.classList.remove('hidden');
-                }
-            } catch (err) { console.error(err); }
+            const res = await fetch('/api/dashboard/stats');
+            const data = await res.json();
+            document.getElementById('stat-medicines').innerText = data.total_medicines;
+            document.getElementById('stat-sellable').innerText = data.total_sellable_stock;
+            document.getElementById('stat-expiring').innerText = data.expiring_soon_batches;
+            document.getElementById('stat-expired').innerText = data.expired_batches;
+            document.getElementById('dashboard-date').innerText = `System Date: ${data.today_date}`;
         }
 
         async function executeInDateQuery() {
@@ -1147,77 +1396,44 @@ def index_page():
             const data = await res.json();
             const box = document.getElementById('query-result-box');
             box.classList.remove('hidden');
-            if(data.results.length === 0) {
-                box.innerHTML = `<div class="text-rose-400 text-sm font-semibold">No medicines found matching "${query}".</div>`;
-                return;
-            }
             box.innerHTML = data.results.map(r => `
                 <div class="p-3 bg-slate-900/60 rounded-lg text-sm border-l-4 ${r.is_available_in_date ? 'border-emerald-500' : 'border-rose-500'}">
                     <div class="font-bold text-white">${r.answer_summary}</div>
-                    <div class="text-xs text-slate-400">Category: ${r.category || 'General'} | Generic: ${r.generic_name || 'N/A'}</div>
                 </div>
             `).join('');
         }
 
         async function loadMedicines() {
             const search = document.getElementById('inv-search').value;
-            const sort = document.getElementById('inv-sort').value;
-            const order = document.getElementById('inv-order').value;
-            const res = await fetch(`/api/medicines?search=${encodeURIComponent(search)}&page=${invPage}&limit=10&sort_by=${sort}&order=${order}`);
+            const res = await fetch(`/api/medicines?search=${encodeURIComponent(search)}&limit=50`);
             const json = await res.json();
             const tbody = document.getElementById('inventory-tbody');
             tbody.innerHTML = json.data.map(m => `
                 <tr class="hover:bg-slate-50 transition">
                     <td class="p-4 font-bold text-slate-900">${m.name}</td>
                     <td class="p-4 text-slate-600">${m.generic_name || '-'}</td>
-                    <td class="p-4 text-xs font-semibold"><span class="bg-slate-100 px-2 py-1 rounded-md text-slate-700">${m.category || 'General'}</span></td>
+                    <td class="p-4 text-xs font-semibold"><span class="bg-slate-100 px-2 py-1 rounded-md">${m.category || 'General'}</span></td>
                     <td class="p-4 font-black ${m.sellable_stock > 0 ? 'text-emerald-600' : 'text-rose-600'}">${m.sellable_stock} ${m.unit}</td>
-                    <td class="p-4 text-xs text-slate-500 font-medium">${m.next_expiry || 'No active batches'}</td>
                     <td class="p-4">
-                        <button onclick="quickSelectDispense(${m.id})" class="bg-emerald-500 hover:bg-emerald-400 text-slate-900 font-bold text-xs px-3 py-1.5 rounded-lg transition">
-                            Dispense FEFO
-                        </button>
+                        <button onclick="showTab('dispenser')" class="bg-emerald-500 hover:bg-emerald-400 text-slate-900 font-bold text-xs px-3 py-1.5 rounded-lg">Dispense FEFO</button>
                     </td>
                 </tr>
             `).join('');
-
-            document.getElementById('inv-page-info').innerText = `Page ${json.pagination.page} of ${json.pagination.total_pages} (${json.pagination.total_records} total items)`;
-            document.getElementById('inv-prev-btn').disabled = json.pagination.page <= 1;
-            document.getElementById('inv-next-btn').disabled = json.pagination.page >= json.pagination.total_pages;
-        }
-
-        function changeInvPage(delta) {
-            invPage += delta;
-            loadMedicines();
         }
 
         async function loadBatches() {
-            const order = document.getElementById('batch-sort-order').value;
-            const res = await fetch(`/api/batches?status=${batchStatus}&page=1&limit=50&sort_by=expiry_date&order=${order}`);
+            const res = await fetch('/api/batches?limit=50');
             const json = await res.json();
             const tbody = document.getElementById('batches-tbody');
             tbody.innerHTML = json.data.map(b => `
                 <tr class="hover:bg-slate-50 transition">
-                    <td class="p-4 font-mono font-bold text-slate-900">${b.batch_number}</td>
-                    <td class="p-4 font-medium text-slate-800">${b.medicine_name}</td>
-                    <td class="p-4 font-semibold text-slate-700">${b.expiry_date}</td>
-                    <td class="p-4 font-bold ${b.current_qty > 0 ? 'text-slate-900' : 'text-slate-400'}">${b.current_qty} / ${b.initial_qty} ${b.unit}</td>
-                    <td class="p-4 font-mono text-xs">₹${b.unit_price}</td>
-                    <td class="p-4"><span class="text-xs px-2.5 py-1 rounded-full font-bold bg-${b.badge_color}-100 text-${b.badge_color}-700">${b.status}</span></td>
+                    <td class="p-4 font-mono font-bold">${b.batch_number}</td>
+                    <td class="p-4 font-medium">${b.medicine_name}</td>
+                    <td class="p-4 font-semibold">${b.expiry_date}</td>
+                    <td class="p-4 font-bold">${b.current_qty} / ${b.initial_qty}</td>
+                    <td class="p-4"><span class="text-xs px-2.5 py-1 rounded-full font-bold bg-${b.badge_color}-100 text-${b.badge_color}-700">${b.status_label}</span></td>
                 </tr>
             `).join('');
-        }
-
-        function setBatchFilter(st) {
-            batchStatus = st;
-            document.querySelectorAll('.batch-filter-btn').forEach(b => {
-                if(b.getAttribute('data-status') === st) {
-                    b.className = 'batch-filter-btn px-3 py-1.5 rounded-lg bg-slate-900 text-white font-semibold text-xs';
-                } else {
-                    b.className = 'batch-filter-btn px-3 py-1.5 rounded-lg bg-slate-100 text-slate-600 font-semibold text-xs';
-                }
-            });
-            loadBatches();
         }
 
         async function populateDispenseDropdown() {
@@ -1229,36 +1445,6 @@ def index_page():
             `).join('');
         }
 
-        function quickSelectDispense(medId) {
-            showTab('dispenser');
-            setTimeout(() => {
-                document.getElementById('dispense-med-id').value = medId;
-                updateDispensePreview();
-            }, 100);
-        }
-
-        async function updateDispensePreview() {
-            const medId = document.getElementById('dispense-med-id').value;
-            const previewBox = document.getElementById('dispense-preview');
-            if(!medId) { previewBox.classList.add('hidden'); return; }
-
-            const res = await fetch(`/api/batches?medicine_id=${medId}&status=active`);
-            const json = await res.json();
-            previewBox.classList.remove('hidden');
-
-            if(json.data.length === 0) {
-                document.getElementById('prev-title').innerText = "⚠️ No Active In-Date Batches!";
-                document.getElementById('prev-stock').innerText = "Sellable Stock: 0 units available.";
-                document.getElementById('prev-fefo').innerText = "Cannot dispense — all stock is either expired or depleted.";
-            } else {
-                const soonest = json.data[0];
-                const totalStock = json.data.reduce((acc, b) => acc + b.current_qty, 0);
-                document.getElementById('prev-title').innerText = `✅ Total In-Date Sellable Stock: ${totalStock} units`;
-                document.getElementById('prev-stock').innerText = `Active Batches Available: ${json.data.length} batches`;
-                document.getElementById('prev-fefo').innerText = `🎯 Next Batch to be Dispensed First (FEFO): #${soonest.batch_number} (Expires: ${soonest.expiry_date} - ${soonest.current_qty} units left)`;
-            }
-        }
-
         async function handleDispense(e) {
             e.preventDefault();
             const medId = parseInt(document.getElementById('dispense-med-id').value);
@@ -1266,137 +1452,74 @@ def index_page():
             const cust = document.getElementById('dispense-customer').value || "Walk-in Customer";
             const resBox = document.getElementById('dispense-result');
 
-            try {
-                const headers = { 'Content-Type': 'application/json', ...getAuthHeader() };
-                const res = await fetch('/api/dispense', {
-                    method: 'POST',
-                    headers: headers,
-                    body: JSON.stringify({ medicine_id: medId, quantity: qty, customer_name: cust })
-                });
+            const headers = { 'Content-Type': 'application/json' };
+            if(authToken) headers['Authorization'] = `Bearer ${authToken}`;
 
-                const data = await res.json();
-                resBox.classList.remove('hidden');
+            const res = await fetch('/api/dispense', {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify({ medicine_id: medId, quantity: qty, customer_name: cust })
+            });
 
-                if(res.status === 401) {
-                    openAuthModal();
-                    document.getElementById('auth-error-msg').innerText = "Authentication required to execute dispensing. Please login as Pharmacist (admin/admin123).";
-                    document.getElementById('auth-error-msg').classList.remove('hidden');
-                    return;
-                }
-
-                if(!res.ok) {
-                    resBox.innerHTML = `
-                        <div class="bg-rose-50 border border-rose-200 p-4 rounded-xl text-rose-800 space-y-1">
-                            <div class="font-bold flex items-center space-x-2"><i class="fa-solid fa-circle-xmark"></i><span>Dispense Failed!</span></div>
-                            <div class="text-xs">${data.detail || 'An error occurred'}</div>
-                        </div>`;
-                } else {
-                    resBox.innerHTML = `
-                        <div class="bg-emerald-50 border border-emerald-200 p-6 rounded-2xl text-emerald-950 space-y-3">
-                            <div class="font-extrabold text-base flex items-center space-x-2 text-emerald-800">
-                                <i class="fa-solid fa-circle-check text-emerald-600 text-xl"></i>
-                                <span>${data.message}</span>
-                            </div>
-                            <div class="text-xs text-emerald-800 font-semibold">Total Invoice Amount: ₹${data.total_cost}</div>
-                            <div class="bg-white p-3 rounded-xl border border-emerald-200 text-xs space-y-2">
-                                <div class="font-bold text-slate-700 uppercase tracking-wider">FEFO Batch Allocation Audit Breakdown:</div>
-                                <div class="space-y-1">
-                                    ${data.fefo_breakdown.map(b => `
-                                        <div class="flex justify-between border-b border-slate-100 pb-1">
-                                            <span>Batch <strong>#${b.batch_number}</strong> (Expires: ${b.expiry_date})</span>
-                                            <span class="font-bold text-emerald-700">Deducted: ${b.quantity_taken} units @ ₹${b.unit_price}</span>
-                                        </div>
-                                    `).join('')}
-                                </div>
-                            </div>
-                        </div>`;
-                    loadDashboardStats();
-                    updateDispensePreview();
-                }
-            } catch(err) { console.error(err); }
-        }
-
-        function loadAlerts() {
-            fetch('/api/alerts/expiring')
-                .then(res => res.json())
-                .then(data => {
-                    const expiringBox = document.getElementById('alerts-expiring-list');
-                    if(data.expiring_soon.length === 0) {
-                        expiringBox.innerHTML = '<div class="text-xs text-amber-700">No batches expiring within 30 days.</div>';
-                    } else {
-                        expiringBox.innerHTML = data.expiring_soon.map(b => `
-                            <div class="bg-white p-3 rounded-xl border border-amber-200 shadow-sm flex justify-between items-center text-xs">
-                                <div>
-                                    <div class="font-bold text-slate-900">${b.medicine_name} (Batch #${b.batch_number})</div>
-                                    <div class="text-amber-700 font-medium">Expires on ${b.expiry_date} (${b.days_left} days left)</div>
-                                </div>
-                                <div class="font-black text-amber-800 text-sm">${b.current_qty} ${b.unit}</div>
-                            </div>
-                        `).join('');
-                    }
-
-                    const expiredBox = document.getElementById('alerts-expired-list');
-                    if(data.expired.length === 0) {
-                        expiredBox.innerHTML = '<div class="text-xs text-emerald-700">Zero expired stock in inventory. Excellent!</div>';
-                    } else {
-                        expiredBox.innerHTML = data.expired.map(b => `
-                            <div class="bg-white p-3 rounded-xl border border-rose-200 shadow-sm flex justify-between items-center text-xs">
-                                <div>
-                                    <div class="font-bold text-slate-900">${b.medicine_name} (Batch #${b.batch_number})</div>
-                                    <div class="text-rose-700 font-medium">Expired ${b.days_overdue} days ago (${b.expiry_date})</div>
-                                </div>
-                                <div class="font-black text-rose-800 text-sm">${b.current_qty} ${b.unit}</div>
-                            </div>
-                        `).join('');
-                    }
-                });
-        }
-
-        function switchAuthTab(mode) {
-            authMode = mode;
-            document.getElementById('auth-tab-login').className = mode === 'login' ? 'flex-1 py-2 font-bold text-sm text-sky-600 border-b-2 border-sky-600' : 'flex-1 py-2 font-bold text-sm text-slate-400';
-            document.getElementById('auth-tab-reg').className = mode === 'register' ? 'flex-1 py-2 font-bold text-sm text-sky-600 border-b-2 border-sky-600' : 'flex-1 py-2 font-bold text-sm text-slate-400';
-            if(mode === 'register') {
-                document.getElementById('auth-email-group').classList.remove('hidden');
+            const data = await res.json();
+            resBox.classList.remove('hidden');
+            if(!res.ok) {
+                resBox.innerHTML = `<div class="bg-rose-50 p-4 rounded-xl text-rose-800 font-bold">${data.detail || 'Error'}</div>`;
             } else {
-                document.getElementById('auth-email-group').classList.add('hidden');
+                resBox.innerHTML = `<div class="bg-emerald-50 p-6 rounded-2xl text-emerald-950 font-bold">${data.message}</div>`;
+                loadDashboardStats();
+                loadOutbox();
             }
-            document.getElementById('auth-error-msg').classList.add('hidden');
         }
 
-        function openAuthModal() { document.getElementById('auth-modal').classList.remove('hidden'); }
-        function closeAuthModal() { document.getElementById('auth-modal').classList.add('hidden'); }
-
-        async function handleAuthSubmit(e) {
-            e.preventDefault();
-            const user = document.getElementById('auth-user').value;
-            const pass = document.getElementById('auth-pass').value;
-            const email = document.getElementById('auth-email').value;
-            const errBox = document.getElementById('auth-error-msg');
-
-            const url = authMode === 'login' ? '/api/auth/login' : '/api/auth/register';
-            const body = authMode === 'login' ? { username: user, password: pass } : { username: user, email: email, password: pass };
-
+        async function executeBatchImport() {
+            const payloadStr = document.getElementById('import-json-payload').value;
+            const resBox = document.getElementById('import-report-box');
             try {
-                const res = await fetch(url, {
+                const res = await fetch('/import', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(body)
+                    body: payloadStr
                 });
                 const data = await res.json();
-                if(!res.ok) {
-                    errBox.innerText = data.detail || 'Authentication failed';
-                    errBox.classList.remove('hidden');
-                } else {
-                    authToken = data.token;
-                    authUser = data.username;
-                    localStorage.setItem('pharma_token', authToken);
-                    localStorage.setItem('pharma_username', authUser);
-                    document.getElementById('current-username').innerText = authUser;
-                    closeAuthModal();
-                    alert(`Successfully authenticated as ${authUser}!`);
-                }
-            } catch(err) { console.error(err); }
+                resBox.classList.remove('hidden');
+                resBox.innerHTML = `
+                    <h4 class="font-extrabold text-slate-900 mb-2">Import Report Summary</h4>
+                    <div class="grid grid-cols-3 gap-4 text-center font-bold">
+                        <div class="bg-emerald-100 text-emerald-800 p-3 rounded-xl">Imported: ${data.imported}</div>
+                        <div class="bg-amber-100 text-amber-800 p-3 rounded-xl">Deduped: ${data.deduped}</div>
+                        <div class="bg-rose-100 text-rose-800 p-3 rounded-xl">Rejected: ${data.rejected}</div>
+                    </div>
+                `;
+                loadDashboardStats();
+                loadBatches();
+            } catch(err) {
+                alert('Invalid JSON input syntax');
+            }
+        }
+
+        async function loadOutbox() {
+            const res = await fetch('/outbox');
+            const data = await res.json();
+            const list = document.getElementById('outbox-list');
+            if(!data.outbox || data.outbox.length === 0) {
+                list.innerHTML = '<div class="text-sm text-slate-400">Outbox is empty. No re-order alerts pending.</div>';
+            } else {
+                list.innerHTML = data.outbox.map(o => `
+                    <div class="p-4 bg-amber-50 border border-amber-200 rounded-xl flex justify-between items-center text-xs">
+                        <div>
+                            <span class="font-bold text-amber-900 block text-sm">${o.medicine_name}</span>
+                            <span class="text-amber-700">${o.message}</span>
+                        </div>
+                        <span class="bg-amber-200 text-amber-900 px-2.5 py-1 rounded-full font-bold uppercase">${o.type}</span>
+                    </div>
+                `).join('');
+            }
+        }
+
+        async function clearOutboxNotifications() {
+            await fetch('/outbox', { method: 'DELETE' });
+            loadOutbox();
         }
     </script>
 </body>

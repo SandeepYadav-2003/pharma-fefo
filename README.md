@@ -9,11 +9,14 @@ PharmaFEFO is a full-stack pharmacy inventory management and automated dispensin
 ### 1. What It Is
 PharmaFEFO is an intelligent batch-level pharmacy inventory and dispensing platform. It tracks individual medicine batches by expiry date, calculates real sellable stock dynamically, and automates multi-batch dispensing sequentially based on earliest expiry.
 
-### 2. Key Features
+### 2. Key Features & Evaluation Level Twists
 - **100% FEFO Automated Dispensing**: Automatically deducts stock from the batch expiring soonest first.
 - **Dynamic In-Date Sellable Stock Engine**: Computes available stock excluding expired batches (`expiry_date < TODAY`).
 - **Instant In-Date Query ("Do we have Paracetamol in date?")**: Specialized API & UI search to verify active stock availability.
-- **Expiry Radar & Heads-up Alerts**: Highlights batches expiring within 30 days and flags expired stock for isolation.
+- **Level 1 — T2 Automation (`POST /clock`)**: Daily job flags batches expiring within 7 days, quarantines expired ones, and returns count metrics.
+- **Level 2 — T4 Messy Data Import (`POST /import`)**: Imports messy batch data (handling nulls, `'10 units'`, `dd/mm/yyyy` vs ISO dates, and duplicates) returning `{ imported, deduped, rejected }`.
+- **Level 3 — T1 Notification Service Integration (`GET /outbox`)**: Automatically triggers re-order alerts in the outbox when in-date stock falls below a medicine's minimum threshold.
+- **Expiry Radar & Heads-up Alerts**: Highlights batches expiring within 30 days and flags expired stock for quarantine isolation.
 - **Master Stock Ledger with Sorting & Pagination**: Searchable table sorted by expiry date, batch number, or quantity.
 - **Embedded Product Landing Page & Interactive Dashboard**: Sleek UI with real-time metrics.
 
@@ -46,6 +49,12 @@ python app.py
 ```
 *The server will automatically initialize SQLite database `pharma_fefo.db`, dynamically seed fresh date-relative sample batches (Paracetamol, Amoxicillin, Ibuprofen, Cetirizine relative to system TODAY), and start on `http://0.0.0.0:8000`.*
 
+### Running Automated Test Suites
+```bash
+python test_app.py
+python test_twists.py
+```
+
 ### Accessing the Web Application
 Open your browser or Codespaces forwarded port:
 - **Web UI**: `http://localhost:8000`
@@ -55,32 +64,31 @@ Open your browser or Codespaces forwarded port:
 
 ## ⚡ 15-Second Evaluator Demo Script
 
-Run this command pair in your terminal to verify FEFO correctness, multi-batch splitting, expired stock isolation, and error handling instantly:
-
-### Step 1: Login to get Bearer Token
+### Step 1: Test Level 1 Daily Clock Job (`POST /clock`)
 ```bash
-curl -X POST "http://localhost:8000/api/auth/login" \
+curl -X POST "http://localhost:8000/clock" \
      -H "Content-Type: application/json" \
-     -d '{"username":"pharmacist","password":"admin123"}'
+     -d '{}'
 ```
+*Returns `expiring_within_7_days` and `quarantined_expired` batch count report.*
 
-### Step 2: Test FEFO Dispense (180 Units of Paracetamol)
+### Step 2: Test Level 2 Messy Batch Import (`POST /import`)
 ```bash
-curl -X POST "http://localhost:8000/api/dispense" \
+curl -X POST "http://localhost:8000/import" \
      -H "Content-Type: application/json" \
-     -H "Authorization: Bearer <TOKEN_FROM_STEP_1>" \
-     -d '{"medicine_id": 1, "quantity": 180, "customer_name": "Walk-in Customer"}'
+     -d '[
+       {"medicine_name": "Paracetamol 500mg", "batch_number": "MESSY-01", "expiry_date": "15/12/2026", "quantity": "100 units"},
+       {"medicine_name": "Paracetamol 500mg", "batch_number": "MESSY-01", "expiry_date": "15/12/2026", "quantity": "50 units"},
+       {"medicine_name": "Ibuprofen 400mg", "batch_number": null, "expiry_date": "invalid", "quantity": "none"}
+     ]'
 ```
-*With 150 units expiring in 15 days, 300 in 180 days, and 50 expired 10 days ago, the response demonstrates taking 150 from the 15-day batch, 30 from the 180-day batch, while leaving the expired batch completely untouched!*
+*Returns exact `{ "imported": 1, "deduped": 1, "rejected": 1 }` report.*
 
-### Step 3: Test Over-Deduction Rejection
+### Step 3: Test Level 3 Notification Service Re-order Outbox (`GET /outbox`)
 ```bash
-curl -X POST "http://localhost:8000/api/dispense" \
-     -H "Content-Type: application/json" \
-     -H "Authorization: Bearer <TOKEN_FROM_STEP_1>" \
-     -d '{"medicine_id": 1, "quantity": 9999}'
+curl -X GET "http://localhost:8000/outbox"
 ```
-*Returns HTTP 400 with "Insufficient sellable stock", cleanly rejecting the request without partial deductions.*
+*Returns outbox notification entries triggered when stock drops below threshold.*
 
 ---
 
@@ -88,14 +96,17 @@ curl -X POST "http://localhost:8000/api/dispense" \
 
 | Method | Endpoint | Auth | Description |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/` | Public | Serves the Full-Stack Web Application (Landing Page, Dashboard, Inventory, Dispenser) |
+| `GET` | `/` | Public | Serves the Full-Stack Web Application (Landing Page, Dashboard, Inventory, Dispenser, Import, Outbox) |
+| `POST` | `/clock` \| `/api/clock` | Public | **Level 1 Automation Job**: Flags batches expiring in 7 days & quarantines expired stock |
+| `POST` | `/import` \| `/api/import` | Public | **Level 2 Messy Data Importer**: Cleans messy data into stock and reports `{ imported, deduped, rejected }` |
+| `GET` | `/outbox` \| `/api/outbox` | Public | **Level 3 Notification Outbox**: Serves re-order alert notifications |
 | `POST` | `/api/auth/register` | Public | Register new user account (Salted PBKDF2 hashing, validated email/password) |
 | `POST` | `/api/auth/login` | Public | Authenticate user and receive JWT Bearer token |
 | `GET` | `/api/dashboard/stats` | Public | High-level metrics (total medicines, sellable stock, expiring soon count, expired count) |
 | `GET` | `/api/medicines` | Public | List all medicines with pagination (`limit <= 100`), search, & sorting |
 | `POST` | `/api/medicines` | Bearer | Create a new medicine entry |
 | `GET` | `/api/medicines/search` | Public | Instant in-date query engine (e.g. `?q=paracetamol` across name, generic & category) |
-| `GET` | `/api/batches` | Public | List batch ledger with status filters (`all`, `active`, `expiring_soon`, `expired`) & sorting |
+| `GET` | `/api/batches` | Public | List batch ledger with status filters (`all`, `active`, `expiring_soon`, `expired`, `quarantined`) & sorting |
 | `POST` | `/api/batches` | Bearer | Add a new batch with batch number, expiry date, initial quantity, and unit price |
 | `POST` | `/api/dispense` | Bearer | **FEFO Dispensing Core Engine**: Deducts quantity sequentially from soonest-expiring active batches |
 | `GET` | `/api/alerts/expiring` | Public | Fetch batches expiring within 30 days and expired batches |
@@ -104,15 +115,15 @@ curl -X POST "http://localhost:8000/api/dispense" \
 
 ## 🏗️ Architecture & Production Folder Structure Notes
 
-For the 2.5-hour timed assessment, the application was intentionally implemented as a single, self-contained `app.py` file to eliminate module import overhead and guarantee zero-friction execution in Codespaces.
+For the 2.5-hour timed assessment, the application was intentionally implemented as a self-contained `app.py` file to eliminate module import overhead and guarantee zero-friction execution in Codespaces.
 
 In a full production environment, this structure maps into:
 ```text
 pharma_fefo/
 ├── app/
-├── routers/          # auth.py, medicines.py, batches.py, dispense.py
+├── routers/          # auth.py, medicines.py, batches.py, dispense.py, automation.py, import.py, outbox.py
 ├── models/           # pydantic schemas & sqlalchemy models
-├── services/         # fefo_engine.py, security.py
+├── services/         # fefo_engine.py, data_cleaner.py, security.py
 ├── database.py       # sqlite connection pool
 └── main.py           # fastapi app entry point
 ```
