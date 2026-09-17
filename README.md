@@ -1,6 +1,6 @@
-# PharmaFEFO — Smart Pharmacy Stock & FEFO Dispensing Engine
+# Pharmacy Stock Management System (`problem_code: pharmacy_stock`)
 
-PharmaFEFO is a full-stack pharmacy inventory management and automated dispensing system designed to solve batch expiry management. Built specifically for neighbourhood pharmacies, it guarantees that stock is dispensed **First-Expiry-First-Out (FEFO)** and strictly prevents expired medicines from ever reaching patients.
+PharmaFEFO is a full-stack pharmacy inventory management and automated dispensing system built for the **Auriga IT Round 2 placement assessment** (Problem Code: `pharmacy_stock`). Built specifically for neighbourhood pharmacies, it guarantees that stock is dispensed **First-Expiry-First-Out (FEFO)** and strictly prevents expired medicines from ever reaching patients.
 
 ---
 
